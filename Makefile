@@ -1,0 +1,29 @@
+PY := .venv/bin/python
+UV := $(HOME)/.local/bin/uv
+
+.PHONY: setup index ui chat test api widget widget-dev
+
+setup:            ## create .venv on Python 3.12 and install pinned deps
+	$(UV) venv --python 3.12 .venv
+	$(UV) pip install --python $(PY) -r requirements.txt
+
+index:            ## rebuild the menu/FAQ search index from MongoDB
+	$(PY) -m app.ingestion.sync
+
+ui:               ## Streamlit chat UI on http://localhost:8501
+	.venv/bin/streamlit run ui.py
+
+chat:             ## terminal chat
+	$(PY) chat.py --branch gulberg --debug
+
+test:
+	$(PY) -m pytest -q tests
+
+api:              ## website API (+ built widget at /widget/) on http://localhost:8000
+	.venv/bin/uvicorn app.api:app --reload --port 8000
+
+widget:           ## build the embeddable widget into widget/dist
+	cd widget && npm ci && npm run build
+
+widget-dev:       ## widget dev server on http://localhost:5173 (run `make api` too)
+	cd widget && npm run dev

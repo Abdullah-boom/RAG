@@ -1,0 +1,32 @@
+# docker compose up -d --build     -> API + widget on http://localhost:8000, chat memory in Redis
+# docker compose run --rm api python -m app.ingestion.sync   -> rebuild the menu index (after menu changes)
+services:
+  api:
+    build: .
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./index:/app/index   # search index files (built by the sync command above)
+      - ./logs:/app/logs     # traces.jsonl
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.2
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  redis-data:

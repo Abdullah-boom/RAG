@@ -1,0 +1,11 @@
+.venv/
+.git/
+.env
+**/__pycache__/
+.pytest_cache/
+logs/
+index/
+widget/node_modules/
+widget/dist/
+docs/
+.vscode/

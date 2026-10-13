@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Widget demo</title>
+    <style>
+      body { font-family: Georgia, serif; max-width: 720px; margin: 48px auto; padding: 0 16px; color: #222; }
+      code { background: #f3f3f3; padding: 2px 6px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>Host website (demo)</h1>
+    <p>This page stands in for the real website. The chat bubble in the corner is the widget; its styles are
+      isolated, so this page's serif font and CSS don't leak into it.</p>
+    <p>On the real site the same widget is one tag:
+      <code>&lt;script src="https://API_HOST/widget/cheezious-chat.js" defer&gt;&lt;/script&gt;</code></p>
+    <script type="module" src="/src/main.tsx" data-api-url="http://localhost:8000"></script>
+  </body>
+</html>
