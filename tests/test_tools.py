@@ -175,3 +175,11 @@ def test_category_query_lists_every_item_of_that_kind(monkeypatch):
         r = t.search_menu(t.RequestContext(None, "b1", user_message=q), t.SearchMenuArgs(query=q))
         assert r["match"] == "category" and r["count"] == 3
         assert [i["name"] for i in r["items"]] == ["Reggy Burger", "Bazinga Burger", "Bazooka"]  # cheapest first
+
+
+@pytest.mark.parametrize("said,is_wish", [("i want something cheesey", True), ("kuch teekha chahiye", True),
+                                          ("anything light?", True), ("tiqqa pizza", False), ("zinger max", False)])
+def test_descriptions_are_wishes_not_names(said, is_wish):
+    """'something cheesey' gets suggestions; only item names get "couldn't find exactly"."""
+    import app.tools as t
+    assert bool(t.DESCRIPTION.search(said)) is is_wish

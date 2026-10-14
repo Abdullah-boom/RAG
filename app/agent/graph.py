@@ -35,7 +35,7 @@ from langgraph.graph.message import add_messages
 from pymongo.errors import PyMongoError
 
 from app import config as settings
-from app.agent.intents import QUESTION, add_call, prefetch_tools
+from app.agent.intents import ALL_TOPICS, QUESTION, add_call, prefetch_tools, tools_for, topics
 from app.cart import chosen_from_offered, pointed_item
 from app.agent.guards import (LANGUAGE_HINTS, MAX_MESSAGE_CHARS, NOT_ROMAN_URDU, REPLY_NOTES, check_answer,
                                detect_language, pre_check, redact_obj)
@@ -62,6 +62,12 @@ CARD_WARNINGS = {
                    "آن لائن ادائیگی منتخب کریں اور ایپ کے محفوظ چیک آؤٹ میں ادائیگی کریں۔",
 }
 CARD_WARNINGS["mixed"] = CARD_WARNINGS["roman_urdu"]
+WHICH_ONE = {
+    "latin": "There's more than one that fits. Which one would you like? Tap one below, or tell me its name.",
+    "roman_urdu": "Is mein ek se zyada options hain. Aap kaunsa lena chahenge? Neeche se chunein ya naam batayein.",
+    "mixed": "Is mein ek se zyada options hain. Aap kaunsa lena chahenge? Neeche se chunein ya naam batayein.",
+    "urdu_script": "اس میں ایک سے زیادہ آپشن ہیں۔ آپ کون سا لینا چاہیں گے؟ نیچے سے چنیں یا نام بتائیں۔",
+}
 FALLBACKS = {
     "latin": SAFE_FALLBACK,
     "roman_urdu": "Maaf kijiye, iska pakka jawab nahi bana saka. Thora alag tareeqe se poochein, ya app mein menu "
@@ -104,6 +110,8 @@ class State(TypedDict, total=False):
     steps: List[dict]
     retried: bool
     answer: Optional[str]
+    prefetched: bool  # code already ran the lookup this turn: the model only words the reply (no tool schemas)
+    topics: List[str]  # rule packs + tools this message needs (intents.topics); all of them when unclear
     fallback: bool  # no draft passed the guard: answer is FALLBACKS / FOUND_FALLBACKS, cards = everything found
     offline: bool
     db_error: bool  # a Mongo read failed this turn: answer with one clear error, nothing partial
@@ -126,11 +134,20 @@ def _turn_messages(state: State) -> List[AnyMessage]:
 
 
 def _history(state: State) -> List[AnyMessage]:
+    """The last HISTORY_TURNS exchanges, newest first kept, within HISTORY_MAX_CHARS."""
     msgs = state["messages"]
-    for i, m in enumerate(msgs):
-        if m.id == state["turn_id"]:
-            return msgs[:i][-2 * settings.HISTORY_TURNS:]
-    return []
+    past = next((msgs[:i] for i, m in enumerate(msgs) if m.id == state["turn_id"]), [])
+    past = past[-2 * settings.HISTORY_TURNS:]
+    kept, size = [], 0
+    for m in reversed(past):
+        size += len(m.content if isinstance(m.content, str) else str(m.content))
+        if size > settings.HISTORY_MAX_CHARS:
+            break
+        kept.append(m)
+    kept.reverse()
+    if kept and not isinstance(kept[0], HumanMessage):  # never start mid-exchange
+        kept = kept[1:]
+    return kept
 
 
 # ---------- LLM ----------
@@ -168,17 +185,19 @@ def _retry_after(e: RateLimitError) -> float:
         return 60.0
 
 
-def _invoke_llm(messages: List[AnyMessage], allow_tools: bool) -> AIMessage:
-    """Ollama: the local model, no rate limits. Groq: main model, then fallbacks when rate limited (each Groq
-    model has its own free-tier quota); if all are limited but one frees up within a few seconds, wait once and retry."""
+def _invoke_llm(messages: List[AnyMessage], allow_tools) -> AIMessage:
+    """allow_tools: False (no tools), True (all) or a list of tool names (only those). Ollama: the local model.
+    Groq: main model, then fallbacks when rate limited (each Groq model has its own free-tier quota); if all are
+    limited but one frees up within a few seconds, wait once and retry."""
+    schemas = (tool_schemas(None if allow_tools is True else list(allow_tools))) if allow_tools else None
     if settings.LLM_PROVIDER == "ollama":
-        llm = _ollama().bind_tools(tool_schemas()) if allow_tools else _ollama()
+        llm = _ollama().bind_tools(schemas) if schemas else _ollama()
         return llm.invoke(messages)
 
     def attempt():
         last = None
         for model in [settings.GROQ_MODEL] + settings.GROQ_FALLBACK_MODELS:
-            llm = _llm(model).bind_tools(tool_schemas()) if allow_tools else _llm(model)
+            llm = _llm(model).bind_tools(schemas) if schemas else _llm(model)
             try:
                 return llm.invoke(messages)
             except RateLimitError as e:
@@ -202,12 +221,43 @@ def _menu_names() -> tuple:
                          for d in index().docs if d["metadata"]["kind"] == "menu"}))
 
 
-def _system_prompt(ctx: RequestContext) -> str:
-    branch = repo.get_branch_status(ctx.branch_id) or {}
-    tmpl = (settings.ROOT / "app" / "agent" / "prompts" / "system.md").read_text()
-    return tmpl.format(branch_name=branch.get("branch", "unknown"), branch_city=branch.get("city", ""),
-                       logged_in="yes" if ctx.user_id else "no (guest; order lookups unavailable)",
-                       now=datetime.now(repo.PK_TZ).strftime("%A %d %B %Y, %I:%M %p"))
+PROMPTS = settings.ROOT / "app" / "agent" / "prompts"
+BRANCH_INFO_TTL_S = 60
+_branch_info: Dict[str, tuple] = {}
+
+
+@lru_cache(maxsize=None)
+def _prompt_file(name: str) -> str:
+    """Prompt parts are read once per process, not on every model call."""
+    return (PROMPTS / name).read_text().strip()
+
+
+def _branch_brief(branch_id: str) -> dict:
+    """Branch name and city for the context block, cached briefly (it's in every prompt; it rarely changes)."""
+    hit = _branch_info.get(branch_id)
+    if hit and time.time() - hit[0] < BRANCH_INFO_TTL_S:
+        return hit[1]
+    info = repo.get_branch_status(branch_id) or {}
+    _branch_info[branch_id] = (time.time(), info)
+    return info
+
+
+def build_system_prompt(ctx: RequestContext, topic_list: List[str], language: str, offered: List[dict]) -> str:
+    """core (never changes) + this message's rule packs (fixed order) + the context block last. Stable text first,
+    so a provider or Ollama can reuse the start of the prompt across calls."""
+    branch = with_retry(_branch_brief, ctx.branch_id)
+    shown = ""
+    if offered:
+        shown = ("Items your last answer showed, in order: "
+                 + "; ".join(f"{n}. {o['name']}" + (f" ({o['type']})" if o.get("type") else "")
+                             for n, o in enumerate(offered, 1))
+                 + ". \"The first one\" / \"pehli wali\" / a size refers to these.\n")
+    context = _prompt_file("packs/context.md").format(
+        branch_name=branch.get("branch", "unknown"), branch_city=branch.get("city", ""),
+        logged_in="yes" if ctx.user_id else "no (guest; order lookups unavailable)",
+        now=datetime.now(repo.PK_TZ).strftime("%A %d %B %Y, %I:%M %p"),
+        language=LANGUAGE_HINTS[language], offered=shown)
+    return "\n\n".join([_prompt_file("core.md")] + [_prompt_file(f"packs/{t}.md") for t in topic_list] + [context])
 
 
 def _for_llm(result: dict) -> str:
@@ -235,7 +285,8 @@ def pre_checks(state: State) -> dict:
     human = state["messages"][-1]
     cleaned = pre_check(human.content if isinstance(human.content, str) else "")
     base = {"turn_id": human.id, "started_at": time.time(), "tool_results": [], "tools_called": [],
-            "steps": [], "retried": False, "answer": None, "fallback": False, "offline": False, "db_error": False,
+            "steps": [], "retried": False, "answer": None, "fallback": False, "prefetched": False, "topics": [],
+            "offline": False, "db_error": False,
             "cart_before": list(state.get("cart") or [])}
     if cleaned is None:
         return {**base, "answer": f"Please send a message under {MAX_MESSAGE_CHARS} characters."}
@@ -252,20 +303,21 @@ def agent(state: State, config: RunnableConfig) -> dict:
     ctx = _ctx(config)
     if not state["tools_called"] and not state["retried"]:
         _status("Thinking…")
+    topic_list = state.get("topics") or list(ALL_TOPICS)
     try:
-        system = with_retry(_system_prompt, ctx)
+        system = build_system_prompt(ctx, topic_list, state["language"], state.get("offered") or [])
     except PyMongoError:
         return {"db_error": True, "steps": state["steps"] + [{"error": DB_UNAVAILABLE}]}
     turn = _turn_messages(state)
     note = REPLY_NOTES.get(state["language"])
     if note:  # prompt copy only: memory and the guards keep the customer's own words
         turn = [HumanMessage(content=f"{turn[0].content}\n\n{note}")] + turn[1:]
-    prompt = ([SystemMessage(system)] + _history(state)
-              + [SystemMessage(LANGUAGE_HINTS[state["language"]] + _offered_note(state))]
-              + turn)
+    prompt = [SystemMessage(system)] + _history(state) + turn  # one system message, then the conversation
     try:
-        # After a pre-run add_to_cart the model only reports what the cart code did: no second add.
-        allow = len(state["tools_called"]) < settings.MAX_TOOL_CALLS and "add_to_cart" not in state["tools_called"]
+        # When code already ran the lookup, the model only words the reply: no second add, and no tool schemas
+        # (~2k tokens per call; Groq's free tier allows ~8k tokens a minute).
+        allow = (tools_for(topic_list) if len(state["tools_called"]) < settings.MAX_TOOL_CALLS
+                 and not state.get("prefetched") else False)
         msg = _invoke_llm(prompt, allow_tools=allow)
     except Exception as e:  # noqa: BLE001 - LLM down / timeout / quota: fall back, never crash
         return {"offline": True, "steps": state["steps"] + [{"error": type(e).__name__}]}
@@ -305,16 +357,19 @@ def prefetch(state: State, config: RunnableConfig) -> dict:
             calls = [("search_menu", {"query": pointed["name"], "picked": True})]
         elif not QUESTION.search(said) and chosen_from_offered(said, offered):
             calls = [add_call(said)]  # replying to "which one?" with a name: that's choosing it
+    topic_list = topics(said, calls, bool(offered))
     if not calls:
-        return {}
+        return {"topics": topic_list}
     call = AIMessage(content="", tool_calls=[{"name": n, "args": a, "id": f"prefetch_{i}", "type": "tool_call"}
                                              for i, (n, a) in enumerate(calls)])
     out = tools({**state, "messages": state["messages"] + [call]}, config)
     out["messages"] = [call] + out.get("messages", [])
+    out["prefetched"] = True
+    out["topics"] = topic_list
     return out
 
 
-def post_checks(state: State) -> dict:
+def post_checks(state: State, config: RunnableConfig) -> dict:
     """Price + grounding guard. One retry with feedback, then a safe fallback."""
     draft = (state["messages"][-1].content or "").strip()
     if not draft:
@@ -322,7 +377,10 @@ def post_checks(state: State) -> dict:
         # instead of looping back to the agent (an empty answer used to route there until the recursion limit).
         return {**_fallback(state), "steps": state["steps"] + [{"draft": "", "guard_problems": ["no_answer_in_time"]}]}
     turn = _turn_messages(state)
-    problems = check_answer(draft, state["tool_results"], state["tools_called"], turn[0].content, _menu_names())
+    # The customer's branch (cached for the prompt already) may be named; no extra database call on this path.
+    here = (_branch_info.get(_ctx(config).branch_id) or (0, {}))[1].get("branch")
+    problems = check_answer(draft, state["tool_results"], state["tools_called"], turn[0].content, _menu_names(),
+                            [here] if here else [])
     steps = state["steps"] + [{"draft": draft, "guard_problems": problems}]
     if not problems:
         return {"answer": draft, "steps": steps}
@@ -410,17 +468,6 @@ def route_after_post_checks(state: State) -> str:
 
 # ---------- helpers ----------
 
-def _offered_note(state: State) -> str:
-    """So "the first one" / "pehli wali" means the same to the model as to the cart code."""
-    offered = state.get("offered") or []
-    if not offered:
-        return ""
-    listed = "; ".join(f"{n}. {o['name']}" + (f" ({o['type']})" if o.get("type") else "")
-                       for n, o in enumerate(offered, 1))
-    return (f"\nItems your last answer showed the customer, in order: {listed}. If the customer names only a kind "
-            "of item (\"pasta\", \"pizza\"), don't choose one for them: pass their own words to add_to_cart.")
-
-
 def _fallback(state: State) -> dict:
     """Never a dead end: in the customer's language, with whatever the tools really found as cards."""
     lang = state.get("language") if state.get("language") in FALLBACKS else "roman_urdu" \
@@ -493,11 +540,15 @@ def _offline_response(ctx: RequestContext, message: str, state: State) -> dict:
                     "items": [], "suggestions": ["Show my cart"], "handoff": False, "as_of": utc_now_iso()}
         sizes = [(p.get("item"), p.get("valid_sizes")) for r in state.get("tool_results") or []
                  for p in (r.get("problems") or []) if p.get("error") in ("size_required", "unknown_size")]
+        cards = _which_one_cards(state.get("tool_results") or [])
         if sizes and sizes[0][1]:
             name, valid = sizes[0]
             options = ", ".join(f"{v['size']} Rs {v['price']}" if isinstance(v, dict) else str(v) for v in valid)
             return {"answer": f"{name or 'This item'} comes in different sizes ({options}). Which size would you like?",
-                    "items": [], "suggestions": [], "handoff": False, "as_of": utc_now_iso()}
+                    "items": cards, "suggestions": [], "handoff": False, "as_of": utc_now_iso()}
+        if cards:  # the cart code already knows the options: ask "which one?" with them, model or not
+            return {"answer": WHICH_ONE.get(state.get("language"), WHICH_ONE["latin"]), "items": cards,
+                    "suggestions": [], "handoff": False, "as_of": utc_now_iso()}
         return {"answer": "I couldn't update your cart just now. Please try again in a minute.",
                 "items": [], "suggestions": ["Show my cart"], "handoff": False, "as_of": utc_now_iso()}
     # Same search the agent uses (merged duplicates, item types, exactness), so the cards are consistent

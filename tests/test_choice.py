@@ -171,3 +171,23 @@ def test_shown_list_survives_a_question_but_not_a_cart_change(monkeypatch):
     assert [l["name"] for l in out["response"]["cart_lines"]] == ["Crunchy Chicken Pasta"]
     out = graph.invoke({"messages": [g.HumanMessage(content="add it")]}, config=cfg)
     assert [l["name"] for l in out["response"]["cart_lines"]] == ["Crunchy Chicken Pasta"]  # nothing more added
+
+
+def test_model_down_still_asks_which_one_with_options(monkeypatch):
+    """Groq timed out after the cart code had the options: show them, don't say "couldn't update your cart"."""
+    monkeypatch.setattr(g.repo, "get_branch_status", lambda b: {"branch": "Gulberg", "city": "Lahore"})
+    monkeypatch.setattr(g, "price_cart", lambda lines, b: {"lines": [], "item_count": 0, "subtotal": 0})
+    monkeypatch.setattr(g, "_trace", lambda r: None)
+    monkeypatch.setattr(g.repo, "merge_duplicates", lambda items: list({i["item_id"]: i for i in items}.values()))
+
+    def down(*a, **k):
+        raise TimeoutError("groq timed out")
+
+    monkeypatch.setattr(g, "_invoke_llm", down)
+    graph = g.build_graph(InMemorySaver())
+    cfg = {"configurable": {"thread_id": "t", "user_id": None, "branch_id": "b"}}
+    out = graph.invoke({"messages": [g.HumanMessage(content="add pasta to cart")], "cart": []}, config=cfg)
+    assert out["response"]["answer"] == g.WHICH_ONE["latin"]
+    assert {i["name"] for i in out["response"]["items"]} == {"Fettuccine Alfredo Pasta", "Crunchy Chicken Pasta"}
+    out = graph.invoke({"messages": [g.HumanMessage(content="pehli wali")]}, config=cfg)
+    assert out["response"]["cart_lines"][0]["item_id"] in {"f1", "c1"}

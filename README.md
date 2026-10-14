@@ -154,6 +154,9 @@ docker compose up -d --build                          # http://localhost:8000
 Put it behind HTTPS (nginx, Caddy or a cloud load balancer) and set `TRUST_PROXY=true` there so rate limits
 see real client IPs. Re-run the sync command after menu changes.
 
+**Production:** how the prompt is assembled, the anti-hallucination layers and the scale checklist are in
+[docs/production.md](docs/production.md).
+
 ## Evaluation (spec 14)
 
 `eval/golden_set.yaml` holds 314 cases in 22 categories (prices in English / Roman Urdu / Urdu, sizes, typos,

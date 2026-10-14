@@ -151,6 +151,10 @@ def search_menu(ctx: RequestContext, a: SearchMenuArgs) -> dict:
     # Only when the customer seems to NAME an item: budget / deal / description searches aren't names.
     words_note = {} if (a.max_price is not None or a.deals_only) else _customer_words_note(ctx, idx, items)
 
+    if ctx.user_message and DESCRIPTION.search(ctx.user_message):  # suggestions for a wish, best matches first
+        return {"as_of": utc_now_iso(), "match": "suggestions", "items": items[: a.limit],
+                "note": "The customer described what they feel like, not an item name: present these as "
+                        "suggestions that fit, without saying you couldn't find it."}
     # Several different items fit the words: return one per name and let the customer choose (spec rule 8).
     candidates = [i for i in items if _name_key(i["name"]) in related_names]
     by_name = {}
@@ -166,11 +170,20 @@ def search_menu(ctx: RequestContext, a: SearchMenuArgs) -> dict:
     return {"as_of": utc_now_iso(), "items": items[: a.limit], **words_note}
 
 
+# A wish, not a name: "something cheesy", "kuch teekha", "anything light". The results are suggestions, never
+# "couldn't find 'cheesey' exactly" (that framing is for item names like "tiqqa" or "Zinger Max").
+DESCRIPTION = re.compile(
+    r"\b(something|anything|kuch|kuchh|kch|koi|any|cheesy|cheesey|cheezy|spicy|spicey|teekha|tikha|meetha|sweet"
+    r"|crispy|crunchy|saucy|creamy|juicy|loaded|light|healthy|veg|vegetarian|mild|filling|tasty|delicious|yummy"
+    r"|mazedar|mazaydar|lazeez|zabardast|chatpata|mirchi|tez|karara|kurkura|smoky|spicey|tikha|halka|snack|snacks"
+    r"|veggie|sabzi|no\s+meat)\b", re.I)
+
+
 def _customer_words_note(ctx: RequestContext, idx, items: List[dict]) -> dict:
     """Compare the items with what the CUSTOMER typed (the model may have fixed spelling or added words).
     exact=false: no item's full name is in the customer's own words, so the bot must say it is not sure."""
     said = ctx.user_message
-    if not said:
+    if not said or DESCRIPTION.search(said):
         return {}
     said_words = set(_name_key(said).split())
     if any(set(_name_key(i["name"]).split()) <= said_words for i in items):
@@ -354,10 +367,11 @@ def _clean_schema(schema: dict) -> dict:
     return schema
 
 
-def tool_schemas() -> List[dict]:
+def tool_schemas(names: Optional[List[str]] = None) -> List[dict]:
+    """All tools, or only `names` (the tools this message's topics need: fewer tokens, fewer wrong picks)."""
     return [{"type": "function", "function": {
         "name": t.name, "description": t.description, "parameters": _clean_schema(t.args.model_json_schema())}}
-        for t in TOOLS.values()]
+        for t in TOOLS.values() if names is None or t.name in names]
 
 
 SECURITY_ARG = re.compile(r"(user|customer|branch)_?id", re.I)

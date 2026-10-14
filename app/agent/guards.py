@@ -76,8 +76,69 @@ WRONG_SCRIPT = ("replied in Urdu script to a message written in English letters:
 NOT_ROMAN_URDU = "the customer wrote in Roman Urdu: reply in Roman Urdu (Urdu in English letters), not English"
 
 
+# ---------- items the answer presents that don't exist ----------
+# A small model fills gaps with plausible dishes ("Spaghetti", "Classic burger", "Grilled Chicken Pizza"). Anything
+# the answer presents as an item (a list entry or a bold name) must match a real menu item or something a tool
+# returned this turn.
+BOLD = re.compile(r"\*\*([^*\n]{2,60})\*\*")
+LIST_ITEM = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+(?:\*\*)?([^*\n:\u2013\u2014(]{2,60}?)(?:\*\*)?\s*"
+                       r"(?:[:\u2013\u2014(-]|\bRs\b|$)", re.M)
+NOT_NAME_WORDS = set("""
+the a an and with of our your size sizes pcs pc piece pieces x for in on to from per each or only also extra
+small regular medium large party family personal jumbo
+pizza pizzas burger burgers pasta pastas sandwich sandwiches platter platters deal deals combo meal roll rolls
+wing wings starter starters side sides drink drinks dessert desserts flavour flavor flavours flavors item items
+cash card online delivery pickup pick up machine debit credit easypaisa jazzcash qr hbl via payment pay checkout
+subtotal total tax fee fees estimate estimated note notes cart order orders branch hours open closed timings
+price prices rs pkr option options choice choices popular best seller sellers pick picks suggestion suggestions
+yes no ok okay here are is it this that these those more
+next choose select selected required login log method methods confirm confirmed what do step steps problem
+problems missing add added tap button app account status ready kitchen preparing placed delivered rider
+assigned completed canceled cancelled rejected failed pending hold freeze picked waiting way received
+readyatkitchen readyforpickup waitingrider pickedup paymentpending paymentfailed
+""".split())
+
+
+def _name_tokens(text: str) -> set:
+    out = set()
+    for w in re.findall(r"[a-z]+", (text or "").lower()):
+        w = w.replace("q", "k").replace("ee", "i").replace("oo", "u").replace("ph", "f")
+        w = re.sub(r"(.)\1+", r"\1", w)
+        out.add(w[:-1] if len(w) > 3 and w.endswith("s") else w)
+    return out
+
+
+def _names_in(obj) -> List[str]:
+    """Every "name" / "branch" value anywhere in the tool results (items, deals, options, payment methods...)."""
+    if isinstance(obj, dict):
+        return [v for k, v in obj.items() if k in ("name", "branch") and isinstance(v, str)] + \
+            [n for v in obj.values() for n in _names_in(v)]
+    if isinstance(obj, list):
+        return [n for v in obj for n in _names_in(v)]
+    return []
+
+
+def invented_items(answer: str, results: Iterable[dict], menu_names: Iterable[str],
+                   other_names: Iterable[str] = ()) -> List[str]:
+    """other_names: real non-menu names the answer may present (branches)."""
+    known = [_name_tokens(n) - _name_tokens(" ".join(NOT_NAME_WORDS))
+             for n in list(menu_names) + list(other_names) + _names_in(list(results))]
+    known = [k for k in known if k]
+    if not known:
+        return []
+    ignore = _name_tokens(" ".join(NOT_NAME_WORDS))
+    bad = []
+    for cand in BOLD.findall(answer or "") + LIST_ITEM.findall(answer or ""):
+        words = {w for w in _name_tokens(re.sub(r"\d+", " ", ROMAN_URDU.sub(" ", cand))) if len(w) > 2} - ignore
+        if not words:
+            continue
+        if not any(words <= k or (k and k <= words) for k in known):
+            bad.append(cand.strip())
+    return list(dict.fromkeys(bad))
+
+
 def check_answer(answer: str, tool_results: Iterable[dict], tools_called: Iterable[str], user_message: str,
-                 menu_names: Iterable[str] = ()) -> List[str]:
+                 menu_names: Iterable[str] = (), other_names: Iterable[str] = ()) -> List[str]:
     """Return a list of problems; empty means the answer passes."""
     results = list(tool_results)
     called = set(tools_called)
@@ -118,6 +179,10 @@ def check_answer(answer: str, tool_results: Iterable[dict], tools_called: Iterab
     if STATUS_WORDS.search(answer or "") and not (called & (ORDER_TOOLS | PAYMENT_TOOLS)) \
             and "order" in (answer or "").lower():
         problems.append("states an order status without calling an order tool")
+    made_up = invented_items(text, results, menu_names, other_names)
+    if made_up:
+        problems.append(f"names item(s) that aren't on the menu or in this turn's tool results: {made_up[:3]}; "
+                        "only mention items the tools returned")
     return problems
 
 

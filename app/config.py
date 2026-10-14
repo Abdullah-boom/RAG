@@ -32,6 +32,8 @@ INDEX_DIR = ROOT / "index"
 TEMPERATURE = 0.1
 MAX_TOOL_CALLS = 4
 HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "6"))  # past exchanges sent to the LLM; small local models do better with 1-2
+# ...and at most this many characters of them (~4 chars a token), newest kept: one long chat can't blow the budget.
+HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS", "6000"))
 
 # Website API (api.py)
 REDIS_URL = os.getenv("REDIS_URL", "")  # empty = in-process memory (dev only: lost on restart, one worker)

@@ -197,3 +197,44 @@ def prefetch_tools(message: str) -> List[Tuple[str, dict]]:
     if BRANCH.search(PAYMENT_PHRASE.sub(" ", message)):
         calls.append(("check_branch_status", {}))
     return calls[:MAX_PREFETCH]
+
+
+# ---------- topics: which rule packs and tools this message needs ----------
+
+ALL_TOPICS = ("menu", "cart", "payment", "checkout", "branch", "orders", "faq")
+TOOL_TOPIC = {"search_menu": "menu", "get_item_details": "menu", "get_deals": "menu", "get_best_sellers": "menu",
+              "calculate_total": "menu", "add_to_cart": "cart", "remove_from_cart": "cart", "view_cart": "cart",
+              "clear_cart": "cart", "get_payment_methods": "payment", "set_payment_method": "payment",
+              "review_order": "checkout", "check_branch_status": "branch", "get_order_status": "orders",
+              "get_order_history": "orders", "search_faq": "faq"}
+TOPIC_TOOLS = {t: [n for n, tt in TOOL_TOPIC.items() if tt == t] for t in ALL_TOPICS}
+ORDERS = re.compile(_W + r"(my\s+order|mera\s+order|meray\s+order|order\s+(status|kahan|kidhar|kab|history)"
+                    r"|where\s+is\s+my|last\s+order|previous\s+order|purana\s+order|rider|track(ing)?)\b", re.I)
+FAQ = re.compile(_W + r"(how\s+(do|can|to)\s+i|app\b|account|password|log\s*in|sign\s*up|register|notification"
+                 r"|voucher|promo\s*code|wallet|refund|complaint|shikayat|support|helpline|contact)", re.I)
+
+
+def topics(message: str, calls: List[Tuple[str, dict]], offered: bool) -> List[str]:
+    """Topics of this message, from the lookups the code already chose plus a few cues. Menu is always in (items
+    and prices come up everywhere). Nothing recognised -> every topic: the full rules and tools, never fewer."""
+    found = {TOOL_TOPIC[name] for name, _ in calls if name in TOOL_TOPIC}
+    if CART_VIEW.search(message) or CART_CHANGE.search(message) or ADD.search(message) or offered:
+        found.add("cart")
+    if PAYMENT.search(message):
+        found |= {"payment", "cart"}
+    if ORDER_NOW.search(message):
+        found |= {"checkout", "cart", "payment"}
+    if BRANCH.search(PAYMENT_PHRASE.sub(" ", message)):
+        found.add("branch")
+    if ORDERS.search(message):
+        found.add("orders")
+    if FAQ.search(message):
+        found.add("faq")
+    if not found:
+        return list(ALL_TOPICS)
+    found.add("menu")
+    return [t for t in ALL_TOPICS if t in found]
+
+
+def tools_for(topic_list: List[str]) -> List[str]:
+    return [n for t in topic_list for n in TOPIC_TOOLS[t]]

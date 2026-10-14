@@ -112,3 +112,17 @@ def test_cards_match_names_despite_odd_spaces():
     res = [{"items": [{"name": "Somewhat Amazing 1", "price": 1250}, {"name": "Euro", "price": 500}]}]
     cards = g._cards("1. **Somewhat Amazing 1** – Rs 1250", res)
     assert [c["name"] for c in cards] == ["Somewhat Amazing 1"]  # and "Euro" is not matched inside other words
+
+
+def test_made_up_items_are_caught_real_ones_pass():
+    from app.agent.guards import check_answer
+    menu = ["bazinga burger", "reggy burger", "fettuccine alfredo pasta", "crunchy chicken pasta"]
+    made_up = "We have two pastas:\n1. **Spaghetti Regular** – ask for price\n2. **Fettuccine Alfredo Pasta** – Rs 1050"
+    problems = check_answer(made_up, [{"items": [{"name": "Fettuccine Alfredo Pasta", "price": 1050}]}],
+                            ["search_menu"], "pasta kon si hai", menu)
+    assert any("Spaghetti Regular" in p for p in problems)
+    real = "- **Bazinga Burger** – Rs 560\n- **Reggy Burger** – Rs 390\nPay by **Cash on Delivery**. Status: READYATKITCHEN"
+    results = [{"items": [{"name": "Bazinga Burger", "price": 560}, {"name": "Reggy Burger", "price": 390}]}]
+    assert check_answer(real, results, ["search_menu"], "burgers?", menu) == []
+    assert check_answer("Our **I-8 Islamabad** branch is open.", [{"open_now": True}], ["check_branch_status"],
+                        "open?", menu, ["I-8 Islamabad"]) == []
