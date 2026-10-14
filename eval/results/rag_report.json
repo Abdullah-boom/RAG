@@ -1,0 +1,43 @@
+{
+  "report": {
+    "at": "2026-10-13T17:11:10",
+    "names_gulberg": {
+      "items": 51,
+      "mrr": 1.0,
+      "recall@1": 1.0,
+      "recall@5": 1.0,
+      "tool_finds_item": 1.0,
+      "typo_recall@5": 1.0,
+      "roman_urdu_raw_recall@5": 1.0
+    },
+    "names_gulshan": {
+      "items": 51,
+      "mrr": 1.0,
+      "recall@1": 1.0,
+      "recall@5": 1.0,
+      "tool_finds_item": 1.0,
+      "typo_recall@5": 1.0,
+      "roman_urdu_raw_recall@5": 1.0
+    },
+    "cases": {
+      "name": "30/30 (100%)",
+      "typo": "20/20 (100%)",
+      "ambiguity": "12/12 (100%)",
+      "budget_filter": "3/3 (100%)",
+      "fuzzy": "14/14 (100%)",
+      "faq": "3/3 (100%)",
+      "no_result": "10/10 (100%)"
+    },
+    "index_vs_db": {
+      "db_items": 139,
+      "indexed": 139,
+      "missing_from_index": 0,
+      "stale_in_index": 0
+    },
+    "duplicate_names_with_different_prices": [
+      "gulberg: Zalmi Meal (2 products, prices ['[2020]', '[2090]'])",
+      "gulshan: Zalmi Meal (2 products, prices ['[2020]', '[2090]'])"
+    ]
+  },
+  "failures": []
+}

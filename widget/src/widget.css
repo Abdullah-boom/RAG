@@ -168,7 +168,9 @@
 .cz-bubble th, .cz-bubble td { border: 1px solid var(--cz-line); padding: 3px 6px; text-align: left; }
 .cz-retry { display: block; margin-top: 6px; }
 
-.cz-typing { display: inline-flex; gap: 4px; padding: 12px 14px; }
+.cz-working { display: inline-flex; align-items: center; gap: 10px; padding: 11px 14px; }
+.cz-typing { display: inline-flex; gap: 4px; }
+.cz-progress { font-size: 13px; color: var(--cz-muted); }
 .cz-typing span {
   width: 6px;
   height: 6px;
@@ -330,6 +332,25 @@
   background: transparent;
 }
 .cz-branch-option:hover, .cz-branch-option.is-current { background: var(--cz-soft); }
+.cz-branch-option:disabled { color: var(--cz-muted); cursor: not-allowed; background: transparent; }
+.cz-notice {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--cz-soft);
+  border-left: 3px solid var(--cz-accent);
+  font-size: 13px;
+}
+.cz-locating {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+  color: var(--cz-muted);
+}
 .cz-empty { padding: 16px 8px; color: var(--cz-muted); }
 .cz-picker-cancel {
   margin: 0 16px 14px;
@@ -354,3 +375,74 @@
   }
   .cz:has(.cz-panel) .cz-launcher { display: none; }
 }
+
+/* ---------- size picker on item cards, remove buttons in the cart ---------- */
+.cz-sizes { margin-top: auto; display: flex; flex-direction: column; gap: 4px; }
+.cz-size {
+  padding: 4px 8px;
+  border: 1px solid var(--cz-line);
+  border-radius: 8px;
+  background: var(--cz-bg);
+  font-size: 12px;
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+}
+.cz-size:hover:not(:disabled) { border-color: var(--cz-accent); }
+.cz-cart-right { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+.cz-remove {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: var(--cz-soft);
+  color: var(--cz-muted) !important;
+  font-size: 14px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+}
+.cz-remove:hover { background: #ffe3e3; color: var(--cz-bad) !important; }
+
+.cz-qty { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.cz-qty-btn {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--cz-line);
+  border-radius: 50%;
+  background: var(--cz-bg);
+  line-height: 1;
+  padding: 0;
+}
+.cz-qty-btn:hover { background: var(--cz-soft); }
+
+.cz-pay { border: none; margin: 8px 0 4px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.cz-pay legend { font-weight: 700; font-size: 13px; padding: 0; margin-bottom: 4px; }
+.cz-pay-option {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--cz-line);
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.cz-pay-option.is-chosen { border-color: var(--cz-accent); background: var(--cz-soft); }
+.cz-pay-total { white-space: nowrap; text-align: right; }
+.cz-pay-save { color: var(--cz-good); font-weight: 600; }
+
+.cz-review-btn, .cz-confirm-btn {
+  width: 100%;
+  margin: 8px 0 4px;
+  padding: 9px;
+  border: none;
+  border-radius: 10px;
+  font-weight: 700;
+  background: var(--cz-accent);
+  color: #1f1f1f;
+}
+.cz-review-btn:disabled, .cz-confirm-btn:disabled { opacity: 0.6; cursor: wait; }
+.cz-confirm { margin-top: 8px; font-size: 13px; }
+.cz-problems { margin: 8px 0 0; padding-left: 18px; font-size: 13px; color: var(--cz-bad); }

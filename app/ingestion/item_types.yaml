@@ -1,0 +1,14 @@
+# What each item IS, by category. Cheezious category names rarely say it ("Somewhat Local", "Cheezy Treats"
+# are pizza ranges), so without this the bot can't tell a customer that "Chicken Tikka" or "Behari Kebab"
+# is a pizza. The first matching category wins; deals are also detected from the product's deal flag.
+# Business team: review and extend. Unmapped categories (e.g. Local Love, The Royal) get no type.
+pizza: [Somewhat Local, Somewhat Sooper, Special Pizza, Thin Crust Pizza, Malai Tikka, Cheezy Treats, Cheezious Treat, Cheezious Square]
+deal: [Pizza Deals, Somewhat Amazing, Extremely Good Deals, Super deals, Midnight deal, App Exclusive, Zalmi Meal]
+burger: [Burgerz, Burger Zone, Bhook Ka The End!, "I'm Back!"]
+pasta: [Pastas]
+sandwich or platter: [Sandwiches & Platters]
+starter: [Starters]
+side: [Side Orders]
+fried chicken: [Chicken Delight]
+dessert: [Dessert]
+drink or add-on: [Addons, "Addon's"]

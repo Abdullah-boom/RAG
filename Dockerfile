@@ -20,4 +20,7 @@ RUN useradd --create-home appuser && mkdir -p index logs && chown -R appuser ind
 USER appuser
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"
-CMD ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# WEB_CONCURRENCY = worker processes (each holds the ~400 MB embedding model). Workers import slowly on a
+# busy host, so the supervisor's health check gets a generous timeout instead of killing them mid-start.
+ENV WEB_CONCURRENCY=2
+CMD ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-worker-healthcheck", "60", "--proxy-headers", "--forwarded-allow-ips", "*"]

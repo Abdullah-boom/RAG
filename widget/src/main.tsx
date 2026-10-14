@@ -7,7 +7,9 @@ import css from "./widget.css?inline";
 //                 data-title="Cheezious Assistant"       (optional)
 //                 data-color="#f59f00"                   (optional: accent colour)
 //                 data-position="right"></script>        (optional: right | left)
-// Page API: window.CheeziousChat.open() / .close()
+// Login (optional): before the script, set window.CheeziousChatConfig = { getToken: () => currentJwt }
+//   or later call window.CheeziousChat.setAuth(() => currentJwt). Call setAuth(null) on logout.
+// Page API: window.CheeziousChat.open() / .close() / .reset()
 
 // Captured at load time: document.currentScript is null once DOMContentLoaded fires.
 const CURRENT_SCRIPT = document.currentScript as HTMLScriptElement | null;
@@ -23,6 +25,7 @@ function readConfig(): WidgetConfig {
     title: d.title || "Cheezious Assistant",
     color: d.color || "#f59f00",
     position: d.position === "left" ? "left" : "right",
+    getToken: (window as any).CheeziousChatConfig?.getToken,
   };
 }
 

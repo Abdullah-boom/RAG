@@ -7,6 +7,15 @@
     <style>
       body { font-family: Georgia, serif; max-width: 720px; margin: 48px auto; padding: 0 16px; color: #222; }
       code { background: #f3f3f3; padding: 2px 6px; border-radius: 4px; }
+      .dev { font-family: system-ui, sans-serif; font-size: 14px; border: 1px dashed #c9a227; background: #fffbea;
+             border-radius: 10px; padding: 14px 16px; margin: 24px 0; }
+      .dev h2 { font-size: 15px; margin: 0 0 4px; }
+      .dev p { margin: 4px 0 10px; color: #555; }
+      .dev .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      .dev select, .dev input { font: inherit; padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; min-width: 0; }
+      .dev input { flex: 1 1 240px; }
+      .dev button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid #999; background: #fff; cursor: pointer; }
+      .dev .status { margin-top: 8px; font-weight: 600; }
     </style>
   </head>
   <body>
@@ -14,6 +23,64 @@
     <p>This page stands in for the real website, using the built widget exactly as a site would embed it:</p>
     <p><code>&lt;script src="https://API_HOST/widget/cheezious-chat.js" defer&gt;&lt;/script&gt;</code></p>
     <p><button onclick="CheeziousChat.open()">Open chat from the page</button></p>
+
+    <!-- Shown only when the API runs with DEV_LOGIN=true. Stands in for the main app's login. -->
+    <section class="dev" id="dev" hidden>
+      <h2>Local login (dev only)</h2>
+      <p>Pick a customer who has orders, or paste a customer id, to test order questions. The token is signed
+        with your JWT_SECRET, exactly like the main app's will be.</p>
+      <div class="row">
+        <select id="dev-pick"><option value="">Customers with recent orders…</option></select>
+        <input id="dev-id" placeholder="customer id (customers._id)" />
+        <button id="dev-login">Log in</button>
+        <button id="dev-logout">Log out</button>
+      </div>
+      <div class="status" id="dev-status">Guest</div>
+    </section>
+
+    <script>
+      // The widget asks for the token before every request, like the main app will.
+      let devToken = null, devUser = null;
+      try { devToken = sessionStorage.getItem("dev-token"); devUser = sessionStorage.getItem("dev-user"); } catch (e) {}
+      window.CheeziousChatConfig = { getToken: () => devToken };
+
+      const $ = (id) => document.getElementById(id);
+      const short = (id) => id.length > 12 ? id.slice(0, 8) + "…" : id;
+      const showStatus = () => { $("dev-status").textContent = devUser ? "Logged in as " + short(devUser) : "Guest"; };
+      const remember = () => {
+        try {
+          if (devToken) { sessionStorage.setItem("dev-token", devToken); sessionStorage.setItem("dev-user", devUser); }
+          else { sessionStorage.removeItem("dev-token"); sessionStorage.removeItem("dev-user"); }
+        } catch (e) {}
+      };
+      // a different customer must never see the previous one's chat
+      const switched = () => { remember(); showStatus(); window.CheeziousChat && window.CheeziousChat.reset(); };
+
+      fetch("/api/dev/customers").then((r) => (r.ok ? r.json() : null)).then((d) => {
+        if (!d) return; // dev login is off: keep the panel hidden
+        $("dev").hidden = false;
+        for (const c of d.customers) {
+          const o = document.createElement("option");
+          o.value = c.customer_id;
+          o.textContent = `${short(c.customer_id)} · ${c.orders} order${c.orders === 1 ? "" : "s"}`;
+          $("dev-pick").appendChild(o);
+        }
+        showStatus();
+      }, () => {});
+
+      $("dev-pick").onchange = (e) => { $("dev-id").value = e.target.value; };
+      $("dev-login").onclick = async () => {
+        const id = $("dev-id").value.trim();
+        if (!id) return;
+        const r = await fetch("/api/dev/login", { method: "POST", headers: { "Content-Type": "application/json" },
+                                                  body: JSON.stringify({ customer_id: id }) });
+        if (!r.ok) { $("dev-status").textContent = "Login failed: " + (await r.text()); return; }
+        devToken = (await r.json()).token;
+        devUser = id;
+        switched();
+      };
+      $("dev-logout").onclick = () => { devToken = null; devUser = null; switched(); };
+    </script>
     <script src="cheezious-chat.js" defer></script>
   </body>
 </html>

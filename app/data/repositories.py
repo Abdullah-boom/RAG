@@ -5,6 +5,8 @@ Schema notes (from docs/data_audit.md):
 - product.productassociations: per-branch price/availability. productId is a *string*, branchId an ObjectId.
   options[] with title 'Variation'/'Size' hold absolute size prices; other options are choices (extra charge).
 - order.orders: customerId (string), branchId (string), orderNo, status, orderItems, totals.
+- product.polygons: GeoJSON `polygon` ([lng, lat] order, 2dsphere index), branchId (ObjectId), type
+  DELIVERYAREA / SUBDELIVERYAREA / BRANCHZONE / REDZONE, isActive + isEnabled flags.
 """
 import re
 import time
@@ -37,29 +39,33 @@ def _clean(name: str) -> str:
 
 # ---------- branches ----------
 
+BRANCH_FIELDS = {"name": 1, "city": 1, "status": 1, "isAvailable": 1, "inactiveReason": 1,
+                 "branchTiming": 1, "facilities": 1, "minOrderAmount": 1, "location": 1}
+
+
 def list_branches(active_only: bool = True) -> List[dict]:
+    """Branch rows with what open_now() needs, so the caller can cache them and still compute "open now"
+    at request time."""
     q = {"status": "ACTIVE", "isVisible": {"$ne": False}} if active_only else {}
-    rows = product_db().branches.find(q, {"name": 1, "city": 1}).max_time_ms(QUERY_TIMEOUT_MS)
-    return [{"branch_id": str(b["_id"]), "name": _clean(b["name"]), "city": b.get("city")} for b in rows]
+    rows = product_db().branches.find(q, BRANCH_FIELDS).max_time_ms(QUERY_TIMEOUT_MS)
+    return [{"branch_id": str(b["_id"]), "name": _clean(b["name"]), "city": b.get("city"),
+             "accepting_orders": _accepting(b), "timing": b.get("branchTiming") or [],
+             "location": ((b.get("location") or {}).get("coordinates") or None)} for b in rows]
 
 
 def _parse_clock(s: str):
     return datetime.strptime(s.strip().lower(), "%I:%M%p").time()
 
 
-def get_branch_status(branch_id: str, now: Optional[datetime] = None) -> Optional[dict]:
-    b = product_db().branches.find_one(
-        {"_id": _oid(branch_id)},
-        {"name": 1, "city": 1, "status": 1, "isAvailable": 1, "inactiveReason": 1,
-         "branchTiming": 1, "facilities": 1, "minOrderAmount": 1},
-        max_time_ms=QUERY_TIMEOUT_MS,
-    )
-    if not b:
-        return None
-    now = now or datetime.now(PK_TZ)
+def _accepting(b: dict) -> bool:
+    return b.get("status") == "ACTIVE" and bool(b.get("isAvailable"))
+
+
+def todays_hours(timing: List[dict], now: datetime) -> tuple:
+    """(today's hour ranges as text, whether `now` falls in one of them). Ranges may cross midnight."""
     day = now.strftime("%A").upper()
-    hours, open_now = [], False
-    for d in b.get("branchTiming") or []:
+    hours, inside = [], False
+    for d in timing or []:
         if d.get("day") != day:
             continue
         for t in d.get("timing") or []:
@@ -69,19 +75,80 @@ def get_branch_status(branch_id: str, now: Optional[datetime] = None) -> Optiona
             except (KeyError, ValueError):
                 continue
             cur = now.time()
-            open_now |= (start <= cur <= end) if start <= end else (cur >= start or cur <= end)
-    accepting = b.get("status") == "ACTIVE" and bool(b.get("isAvailable"))
+            inside |= (start <= cur <= end) if start <= end else (cur >= start or cur <= end)
+    return hours, inside
+
+
+def open_now(row: dict, now: Optional[datetime] = None) -> bool:
+    """For a list_branches() row: accepting orders and inside today's hours."""
+    return bool(row["accepting_orders"] and todays_hours(row["timing"], now or datetime.now(PK_TZ))[1])
+
+
+def get_branch_status(branch_id: str, now: Optional[datetime] = None) -> Optional[dict]:
+    b = product_db().branches.find_one({"_id": _oid(branch_id)}, BRANCH_FIELDS, max_time_ms=QUERY_TIMEOUT_MS)
+    if not b:
+        return None
+    hours, inside = todays_hours(b.get("branchTiming") or [], now or datetime.now(PK_TZ))
+    accepting = _accepting(b)
     return {
         "branch_id": str(b["_id"]),
         "branch": _clean(b["name"]),
         "city": b.get("city"),
-        "open_now": bool(accepting and open_now),
+        "open_now": bool(accepting and inside),
         "accepting_orders": accepting,
         "closed_reason": None if accepting else (b.get("inactiveReason") or None),
         "today_hours": hours,
         "services": b.get("facilities") or [],
         "min_order_amount": b.get("minOrderAmount"),
     }
+
+
+# ---------- payment methods ----------
+
+def get_payment_config(branch_id: str) -> Optional[dict]:
+    """The branch's payment switches (product.branchspecificconfigurations: one object per method with
+    isAvailable, paymentType COD/COP/ONLINE and label, the code orders.paymentMethod uses) and tax rates
+    (branches.codTaxRate for cash, onlineTaxRate for online, isTaxExclusive)."""
+    oid = _oid(branch_id)
+    if not oid:
+        return None
+    cfg = product_db().branchspecificconfigurations.find_one(
+        {"branchId": {"$in": [oid, branch_id]}}, max_time_ms=QUERY_TIMEOUT_MS) or {}
+    b = product_db().branches.find_one({"_id": oid}, {"codTaxRate": 1, "onlineTaxRate": 1, "isTaxExclusive": 1},
+                                       max_time_ms=QUERY_TIMEOUT_MS)
+    if not b:
+        return None
+    methods = [{"label": v["label"], "payment_type": v.get("paymentType"), "available": bool(v.get("isAvailable"))}
+               for v in cfg.values() if isinstance(v, dict) and v.get("label") and v.get("paymentType")]
+    return {"methods": methods, "cash_tax_rate": b.get("codTaxRate"), "online_tax_rate": b.get("onlineTaxRate"),
+            "tax_exclusive": bool(b.get("isTaxExclusive"))}
+
+
+# ---------- delivery areas (location -> branch) ----------
+
+DELIVERY_AREA = "DELIVERYAREA"
+RED_ZONE = "REDZONE"  # no delivery inside, even if a delivery area covers the spot
+
+
+def point_query(lat: float, lng: float) -> dict:
+    """$geoIntersects filter for one point. GeoJSON is [longitude, latitude]: the reverse of how people say it."""
+    return {"polygon": {"$geoIntersects": {"$geometry": {"type": "Point", "coordinates": [lng, lat]}}},
+            "isActive": True, "isEnabled": True}
+
+
+def branches_covering(lat: float, lng: float) -> List[str]:
+    """Ids of branches whose active delivery area contains the point, minus branches with an active red zone
+    there. Uses the polygons' 2dsphere index; several branches can match where areas overlap."""
+    q = point_query(lat, lng)
+    rows = list(product_db().polygons.find({**q, "type": {"$in": [DELIVERY_AREA, RED_ZONE]}},
+                                           {"branchId": 1, "type": 1}).max_time_ms(QUERY_TIMEOUT_MS))
+    red = {str(r["branchId"]) for r in rows if r.get("type") == RED_ZONE}
+    covering = []
+    for r in rows:
+        bid = str(r["branchId"])
+        if r.get("type") == DELIVERY_AREA and bid not in red and bid not in covering:
+            covering.append(bid)
+    return covering
 
 
 # ---------- menu (live facts) ----------
@@ -114,6 +181,23 @@ def _category_names() -> Dict[ObjectId, str]:
     return _CATEGORY_CACHE["names"]
 
 
+_ITEM_TYPES: Dict[str, str] = {}
+
+
+def item_type(categories: List[str], is_deal: bool) -> Optional[str]:
+    """What the item is ("pizza", "burger", "deal"...) from app/ingestion/item_types.yaml."""
+    if not _ITEM_TYPES:
+        import yaml
+        from app.config import ROOT
+        for kind, cats in (yaml.safe_load((ROOT / "app" / "ingestion" / "item_types.yaml").read_text()) or {}).items():
+            for c in cats:
+                _ITEM_TYPES.setdefault(c.lower(), kind)
+    for c in categories:
+        if c and c.lower() in _ITEM_TYPES:
+            return _ITEM_TYPES[c.lower()]
+    return "deal" if is_deal else None
+
+
 def get_items(product_ids: List[str], branch_id: str, detailed: bool = False) -> List[dict]:
     """Live price/availability for products at one branch, in the order given."""
     oids = [o for o in map(_oid, product_ids) if o]
@@ -136,11 +220,12 @@ def get_items(product_ids: List[str], branch_id: str, detailed: bool = False) ->
         if not p:
             continue
         a = assocs.get(pid)
+        cat_names = list(dict.fromkeys(c for c in (cats.get(x) for x in p.get("categoryIds") or []) if c))
         item = {
             "item_id": pid,
             "name": _clean(p["name"]),
-            "category": ", ".join(c for c in (cats.get(x) for x in p.get("categoryIds") or [])
-                                  if c and not JUNK_CATEGORY.search(c)),
+            "type": item_type(cat_names, bool(p.get("isDeal"))),
+            "category": ", ".join(c for c in cat_names if not JUNK_CATEGORY.search(c)),
             "description": (p.get("description") or "").strip()[: 300 if detailed else 90],
             "is_deal": bool(p.get("isDeal")),
             "sold_at_this_branch": a is not None,
@@ -158,7 +243,21 @@ def get_items(product_ids: List[str], branch_id: str, detailed: bool = False) ->
                 item["price_from"] = min(s["price"] for s in sizes if s["price"] is not None)
             if detailed and choices:
                 item["choices"] = choices
+        if item["available"] and not ((item.get("price") or 0) > 0 or item.get("price_from")):
+            item["available"] = False  # no real price (e.g. a Rs 0 placeholder product): never quote or sell it
         out.append(item)
+    return out
+
+
+def merge_duplicates(items: List[dict]) -> List[dict]:
+    """The menu has old and new copies of some products. Copies with the same name AND the same live prices
+    are one thing to a customer: keep the first. Copies whose prices differ are kept (a data problem to fix)."""
+    seen, out = set(), []
+    for i in items:
+        key = (_clean(i.get("name", "")).lower(), i.get("price"), str(i.get("sizes")), i.get("available"))
+        if key not in seen:
+            seen.add(key)
+            out.append(i)
     return out
 
 
@@ -249,7 +348,8 @@ def menu_rows_for_index() -> List[dict]:
 def faq_rows_for_index() -> List[dict]:
     rows = faq_collection().find({"type": "CUSTOMER", "status": "PUBLISH"}, {"question": 1, "answer": 1, "updatedAt": 1})
     return [{"faq_id": str(f["_id"]), "question": f["question"].strip(), "answer": f["answer"].strip(),
-             "source_updated_at": f["updatedAt"].isoformat() + "Z" if f.get("updatedAt") else None} for f in rows]
+             "source_updated_at": f["updatedAt"].isoformat() + "Z" if f.get("updatedAt") else None} for f in rows
+            if not (TEST_NAME.search(f["question"]) and TEST_NAME.search(f["answer"]))]  # "Q: testing A: testing"
 
 
 # ---------- customer-private (always scoped by user_id from server context) ----------

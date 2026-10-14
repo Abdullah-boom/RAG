@@ -2,9 +2,10 @@ import { useState } from "react";
 import Markdown from "react-markdown";
 import type { Message } from "./App";
 import type { Item } from "./api";
-import { priceLabel } from "./format";
+import { priceLabel, rs } from "./format";
 
-type Props = { message: Message; disabled: boolean; onRetry: (q: string) => void; onAsk: (q: string) => void };
+type OnAdd = (item: Item, size?: string) => void;
+type Props = { message: Message; disabled: boolean; onRetry: (q: string) => void; onAdd: OnAdd };
 
 // react-markdown renders no raw HTML, so model output can't inject markup into the host page.
 const mdComponents = {
@@ -15,8 +16,10 @@ const mdComponents = {
   ),
 };
 
-function ItemCard({ item, disabled, onAsk }: { item: Item; disabled: boolean; onAsk: (q: string) => void }) {
+function ItemCard({ item, disabled, onAdd }: { item: Item; disabled: boolean; onAdd: OnAdd }) {
   const [imgOk, setImgOk] = useState(Boolean(item.image_url));
+  const [picking, setPicking] = useState(false);
+  const sizes = item.sizes ?? [];
   const available = item.available !== false;
   return (
     <div className={`cz-card ${available ? "" : "is-unavailable"}`}>
@@ -27,10 +30,35 @@ function ItemCard({ item, disabled, onAsk }: { item: Item; disabled: boolean; on
         <div className="cz-card-name" dir="auto">
           {item.name}
         </div>
-        {item.category && <div className="cz-card-cat">{item.category}</div>}
+        {(item.type || item.category) && (
+          <div className="cz-card-cat">
+            {/* what it is first ("Pizza"), then the menu range customers may recognise */}
+            {[item.type && item.type[0].toUpperCase() + item.type.slice(1), item.category].filter(Boolean).join(" · ")}
+          </div>
+        )}
         <div className="cz-card-price">{priceLabel(item)}</div>
-        {available ? (
-          <button className="cz-card-add" disabled={disabled} onClick={() => onAsk(`Add 1 ${item.name} to my cart`)}>
+        {available && picking ? (
+          <div className="cz-sizes" role="group" aria-label={`Choose a size for ${item.name}`}>
+            {sizes.map((s) => (
+              <button
+                key={s.size}
+                className="cz-size"
+                disabled={disabled}
+                onClick={() => {
+                  setPicking(false);
+                  onAdd(item, s.size);
+                }}
+              >
+                {s.size} <span className="cz-muted">{rs(s.price)}</span>
+              </button>
+            ))}
+          </div>
+        ) : available ? (
+          <button
+            className="cz-card-add"
+            disabled={disabled}
+            onClick={() => (sizes.length > 1 ? setPicking(true) : onAdd(item, sizes[0]?.size))}
+          >
             Add to cart
           </button>
         ) : (
@@ -41,7 +69,7 @@ function ItemCard({ item, disabled, onAsk }: { item: Item; disabled: boolean; on
   );
 }
 
-export default function MessageView({ message, disabled, onRetry, onAsk }: Props) {
+export default function MessageView({ message, disabled, onRetry, onAdd }: Props) {
   const { role, text, items, error, retry } = message;
   return (
     <>
@@ -58,7 +86,7 @@ export default function MessageView({ message, disabled, onRetry, onAsk }: Props
       {items && items.length > 0 && (
         <div className="cz-cards" role="list">
           {items.map((it) => (
-            <ItemCard key={`${it.item_id}-${it.name}`} item={it} disabled={disabled} onAsk={onAsk} />
+            <ItemCard key={`${it.item_id}-${it.name}`} item={it} disabled={disabled} onAdd={onAdd} />
           ))}
         </div>
       )}

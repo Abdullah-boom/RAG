@@ -10,17 +10,24 @@ from typing import Callable, Dict, List, Optional, Type
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
-from app import cart
+from pymongo.errors import PyMongoError
+
+from app import cart, checkout, payments
 from app.data import repositories as repo
-from app.retrieval import index
+from app.data.db import with_retry
+from app.retrieval import GENERIC_WORDS, index
 
 MAX_RESULT_CHARS = 6000
+DB_UNAVAILABLE = "database_unavailable"  # the graph ends the turn with a clear error when a tool returns this
 
 
 @dataclass(frozen=True)
 class RequestContext:
     user_id: Optional[str]  # from verified auth (here: the CLI's --user); None = guest
     branch_id: str
+    user_message: Optional[str] = None  # the customer's own words this turn (the model rewrites queries)
+    payment_method: Optional[str] = None  # the method already chosen for this branch's cart, if any
+    offered: tuple = ()  # items shown to the customer last turn, in order ({item_id, name, type}): "the first one"
 
 
 def utc_now_iso() -> str:
@@ -40,6 +47,10 @@ class SearchMenuArgs(Args):
                                    "(translate Urdu / Roman Urdu), e.g. 'spicy chicken pizza'.")
     max_price: Optional[float] = Field(None, gt=0, description="Maximum price in PKR, if the customer gave a budget.")
     deals_only: bool = Field(False, description="True to search only deals / combos.")
+    picked: bool = Field(False, description="True ONLY when the customer has clearly chosen one specific item "
+                         "by its exact menu name: replying to options you listed, or naming it with its type "
+                         "('the Chicken Tikka pizza'). A bare dish or ingredient word ('chicken tikka', 'tikka') "
+                         "is NOT a pick.")
     limit: int = Field(5, ge=1, le=5)
 
 
@@ -84,14 +95,95 @@ class CalculateArgs(Args):
 
 # ---------- implementations ----------
 
+MAX_OPTIONS = 6
+MAX_CATEGORY_ITEMS = 10
+# A query that is just a kind of item lists that whole kind (app/ingestion/item_types.yaml), not the top few
+# by similarity, which used to drop items ("burger" missed Reggy Burger, "burgers" missed Bazooka).
+CATEGORY_WORDS = cart.CATEGORY_WORDS
+
+
+def _name_key(name: str) -> str:
+    return " ".join(re.findall(r"\w+", name.lower()))
+
+
+def _is_exact(name: str, query_key: str) -> bool:
+    """The query names this item: all its name words, plus at most generic words ("the ... pizza", "price")."""
+    name_words, query_words = set(_name_key(name).split()), set(query_key.split())
+    return bool(name_words) and name_words <= query_words and query_words - name_words <= GENERIC_WORDS
+
+
+def _category_items(idx, kind: str, branch_id: str, max_price: Optional[float]) -> dict:
+    """Every available item of one kind at this branch, cheapest first."""
+    ids = [d["metadata"]["item_id"] for d in idx.docs if d["metadata"]["kind"] == "menu"
+           and branch_id in (d["metadata"].get("branch_ids") or [])
+           and repo.item_type(d["metadata"].get("categories") or [], d["metadata"].get("is_deal")) == kind]
+    items = [i for i in repo.get_items(ids, branch_id) if i["available"] and i.get("type") == kind]
+    if max_price is not None:
+        items = [i for i in items if (i.get("price_from") or i["price"] or 0) <= max_price]
+    items = sorted(repo.merge_duplicates(items), key=lambda i: i.get("price_from") or i.get("price") or 0)
+    return {"as_of": utc_now_iso(), "match": "category", "category": kind, "count": len(items),
+            "items": items[:MAX_CATEGORY_ITEMS],
+            "note": f"All {kind} items at this branch" + (f" (showing the {MAX_CATEGORY_ITEMS} cheapest)"
+                                                         if len(items) > MAX_CATEGORY_ITEMS else "") + "."}
+
+
 def search_menu(ctx: RequestContext, a: SearchMenuArgs) -> dict:
-    hits = index().search(a.query, "menu", k=8, branch_id=ctx.branch_id,
-                          max_price=a.max_price, deals_only=a.deals_only)
-    items = repo.get_items([h["item_id"] for h in hits], ctx.branch_id)
+    idx = index()
+    kind = CATEGORY_WORDS.get(_name_key(a.query))
+    if kind and not a.deals_only:
+        return _category_items(idx, kind, ctx.branch_id, a.max_price)
+    hits = idx.search(a.query, "menu", k=8, branch_id=ctx.branch_id, max_price=a.max_price, deals_only=a.deals_only)
+    # Every item the customer's words could mean (filters already narrow budget / deal searches).
+    related = [] if (a.max_price is not None or a.deals_only) else idx.keyword_matches(a.query, "menu", ctx.branch_id)
+    related_names = {_name_key(r["name"]) for r in related}
+    query_key = _name_key(a.query)
+    ids = list(dict.fromkeys([h["item_id"] for h in hits] + [r["item_id"] for r in related]))
+    items = repo.get_items(ids, ctx.branch_id)
     if a.max_price is not None:  # coarse index filter -> exact check on live price
         items = [i for i in items if (i.get("price_from") or i["price"] or 0) and (i.get("price_from") or i["price"]) <= a.max_price]
-    items = [i for i in items if i["available"]][: a.limit]
-    return {"as_of": utc_now_iso(), "items": items} if items else {"as_of": utc_now_iso(), "items": [], "note": "no_match"}
+    items = repo.merge_duplicates([i for i in items if i["available"]])
+    if not items:
+        return {"as_of": utc_now_iso(), "items": [], "note": "no_match"}
+
+    exact = [i for i in items if _is_exact(i["name"], query_key)]
+    if a.picked and exact:
+        return {"as_of": utc_now_iso(), "match": "exact", "items": exact[: a.limit]}
+    # Only when the customer seems to NAME an item: budget / deal / description searches aren't names.
+    words_note = {} if (a.max_price is not None or a.deals_only) else _customer_words_note(ctx, idx, items)
+
+    # Several different items fit the words: return one per name and let the customer choose (spec rule 8).
+    candidates = [i for i in items if _name_key(i["name"]) in related_names]
+    by_name = {}
+    for i in sorted(candidates, key=lambda i: i not in exact):  # an exact-name item first
+        by_name.setdefault(_name_key(i["name"]), i)
+    if len(by_name) > 1:
+        options = list(by_name.values())[:MAX_OPTIONS]
+        return {"as_of": utc_now_iso(), "match": "several", "items": options, **words_note,
+                "note": "These different menu items all match the customer's words. Do not pick one: list them "
+                        "with their type (pizza, burger...) and starting price, and ask which one the customer means."}
+    if exact:  # one item fits by name: return just it, so unrelated near-misses don't get mentioned
+        return {"as_of": utc_now_iso(), "match": "exact", "items": exact[: a.limit], **words_note}
+    return {"as_of": utc_now_iso(), "items": items[: a.limit], **words_note}
+
+
+def _customer_words_note(ctx: RequestContext, idx, items: List[dict]) -> dict:
+    """Compare the items with what the CUSTOMER typed (the model may have fixed spelling or added words).
+    exact=false: no item's full name is in the customer's own words, so the bot must say it is not sure."""
+    said = ctx.user_message
+    if not said:
+        return {}
+    said_words = set(_name_key(said).split())
+    if any(set(_name_key(i["name"]).split()) <= said_words for i in items):
+        return {}
+    fixed = idx.corrections(said)
+    distinctive = {w for w in said_words if w not in GENERIC_WORDS and len(w) > 2 and not w.isdigit()}
+    name_words = {w for i in items for w in _name_key(i["name"]).split()}
+    if not fixed and not distinctive & name_words:
+        return {}  # a description ("something spicy"), not an attempt at an item's name
+    note = {"exact": False, "customer_wrote": said[:120]}
+    if fixed:
+        note["spelling_assumed"] = fixed
+    return note
 
 
 def get_item_details(ctx: RequestContext, a: ItemArgs) -> dict:
@@ -100,7 +192,8 @@ def get_item_details(ctx: RequestContext, a: ItemArgs) -> dict:
 
 
 def get_deals(ctx: RequestContext, a: DealsArgs) -> dict:
-    deals = [i for i in repo.get_items(repo.get_deal_ids(ctx.branch_id), ctx.branch_id) if i["available"]]
+    deals = repo.merge_duplicates([i for i in repo.get_items(repo.get_deal_ids(ctx.branch_id), ctx.branch_id)
+                                   if i["available"]])
     return {"as_of": utc_now_iso(), "deals": deals[: a.limit], "total_deals": len(deals),
             "active_discounts": repo.get_active_discounts(ctx.branch_id)}
 
@@ -113,6 +206,52 @@ def get_best_sellers(ctx: RequestContext, a: BestSellersArgs) -> dict:
 def check_branch_status(ctx: RequestContext, a: NoArgs) -> dict:
     s = repo.get_branch_status(ctx.branch_id)
     return {"as_of": utc_now_iso(), **s} if s else {"error": "branch_not_found"}
+
+
+class PaymentArgs(Args):
+    method: str = Field(..., max_length=60, description="The method the customer chose, as they said it or its code, "
+                                                       "e.g. 'cash on delivery', 'online card', 'COD'.")
+
+
+def get_payment_methods(ctx: RequestContext, a: NoArgs, cart_lines: List[dict]):
+    """Methods this branch accepts now, each with the estimated tax and total for the current cart."""
+    subtotal = cart.price_cart(cart_lines, ctx.branch_id)["subtotal"] if cart_lines else 0
+    opts = payments.options(repo.get_payment_config(ctx.branch_id), subtotal)
+    result = {"methods": [{k: o[k] for k in ("code", "name", "when", "pay_now", "tax_rate", "tax", "total")}
+                          for o in opts],
+              "cart_subtotal": subtotal, "chosen": ctx.payment_method, "note": payments.ESTIMATE_NOTE,
+              "secure_note": payments.SECURE_NOTE}
+    if not opts:
+        result["error"] = "no_payment_methods"
+    return result, cart_lines
+
+
+def set_payment_method(ctx: RequestContext, a: PaymentArgs, cart_lines: List[dict]):
+    """Record the customer's choice for this branch's cart. Nothing is charged: the app's checkout does that."""
+    config = repo.get_payment_config(ctx.branch_id)
+    chosen = payments.find(config, a.method)
+    if not chosen:
+        several = payments.candidates(config, a.method)
+        if len(several) > 1:  # "card": at the door or online? Ask, don't guess.
+            return {"error": "ambiguous_method", "requested": a.method,
+                    "ask_which": [{"code": o["code"], "name": o["name"]} for o in several]}, cart_lines
+        return {"error": "unknown_or_unavailable_method", "requested": a.method,
+                "available": [{"code": o["code"], "name": o["name"]} for o in payments.options(config)]}, cart_lines
+    subtotal = cart.price_cart(cart_lines, ctx.branch_id)["subtotal"] if cart_lines else 0
+    est = payments.tax_estimate(subtotal, chosen["tax_rate"], config["tax_exclusive"])
+    return {"payment_method_selected": chosen["code"], "name": chosen["name"], "pay_now": chosen["pay_now"],
+            "cart_subtotal": subtotal, **est, "note": payments.ESTIMATE_NOTE,
+            "secure_note": payments.SECURE_NOTE}, cart_lines
+
+
+def review_order(ctx: RequestContext, a: NoArgs, cart_lines: List[dict]):
+    """Is the cart ready to order, and what's missing? The bot can't place it: the customer taps Confirm."""
+    result = checkout.review(user_id=ctx.user_id, branch_status=repo.get_branch_status(ctx.branch_id),
+                             cart=cart.price_cart(cart_lines, ctx.branch_id) if cart_lines else None,
+                             payment_config=repo.get_payment_config(ctx.branch_id), payment_code=ctx.payment_method)
+    result["next_step"] = ("Ask the customer to tap 'Confirm order' in the cart to place it." if result["ready"]
+                           else "Explain each problem and how to fix it.")
+    return result, cart_lines
 
 
 def get_order_status(ctx: RequestContext, a: OrderStatusArgs) -> dict:
@@ -194,6 +333,16 @@ TOOLS: Dict[str, Tool] = {t.name: t for t in [
     Tool("view_cart", cart.view_cart, cart.EmptyArgs,
          "Show the cart with live prices and subtotal.", uses_cart=True),
     Tool("clear_cart", cart.clear_cart, cart.EmptyArgs, "Empty the cart.", uses_cart=True),
+    Tool("get_payment_methods", get_payment_methods, NoArgs,
+         "Payment methods this branch accepts (cash/card on delivery, online card/wallets), each with estimated "
+         "tax and total for the current cart. Tax differs by method.", uses_cart=True),
+    Tool("review_order", review_order, NoArgs,
+         "When the customer wants to place / confirm the order: checks the cart is ready (items, payment method, "
+         "branch open, minimum order, login) and returns the summary. You cannot place orders: if ready, the "
+         "customer taps 'Confirm order'.", uses_cart=True),
+    Tool("set_payment_method", set_payment_method, PaymentArgs,
+         "Record how the customer wants to pay for this cart (they pay later in the app's checkout; nothing is "
+         "charged here).", uses_cart=True),
 ]}
 
 
@@ -237,10 +386,12 @@ def run_tool_with_cart(ctx: RequestContext, name: str, raw_args: str, cart_lines
     except ValidationError as e:
         return {"error": "invalid_arguments", "details": e.errors(include_url=False, include_input=False)[:3]}, cart_lines
     try:
-        if tool.uses_cart:
-            result, cart_lines = tool.fn(ctx, args, cart_lines)
+        if tool.uses_cart:  # cart tools copy the cart before changing it, so a retry is safe
+            result, cart_lines = with_retry(tool.fn, ctx, args, cart_lines)
         else:
-            result = tool.fn(ctx, args)
+            result = with_retry(tool.fn, ctx, args)
+    except PyMongoError:
+        return {"error": DB_UNAVAILABLE}, cart_lines
     except Exception:  # noqa: BLE001 - never leak stack traces to the model
         return {"error": "temporarily_unavailable"}, cart_lines
     text = json.dumps(result, ensure_ascii=False, default=str)
