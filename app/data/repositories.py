@@ -40,7 +40,13 @@ def _clean(name: str) -> str:
 # ---------- branches ----------
 
 BRANCH_FIELDS = {"name": 1, "city": 1, "status": 1, "isAvailable": 1, "inactiveReason": 1,
-                 "branchTiming": 1, "facilities": 1, "minOrderAmount": 1, "location": 1}
+                 "branchTiming": 1, "facilities": 1, "minOrderAmount": 1, "location": 1, "enablePickup": 1}
+PICKUP_FACILITY = re.compile(r"^pick[\s-]?up$", re.I)  # "PICK-UP" on most branches, "PICK UP" on some
+
+
+def offers_pickup(b: dict) -> bool:
+    """Pickup needs the facility listed and not switched off (enablePickup=False)."""
+    return b.get("enablePickup") is not False and any(PICKUP_FACILITY.match(f or "") for f in b.get("facilities") or [])
 
 
 def list_branches(active_only: bool = True) -> List[dict]:
@@ -49,7 +55,7 @@ def list_branches(active_only: bool = True) -> List[dict]:
     q = {"status": "ACTIVE", "isVisible": {"$ne": False}} if active_only else {}
     rows = product_db().branches.find(q, BRANCH_FIELDS).max_time_ms(QUERY_TIMEOUT_MS)
     return [{"branch_id": str(b["_id"]), "name": _clean(b["name"]), "city": b.get("city"),
-             "accepting_orders": _accepting(b), "timing": b.get("branchTiming") or [],
+             "accepting_orders": _accepting(b), "pickup": offers_pickup(b), "timing": b.get("branchTiming") or [],
              "location": ((b.get("location") or {}).get("coordinates") or None)} for b in rows]
 
 
@@ -99,6 +105,7 @@ def get_branch_status(branch_id: str, now: Optional[datetime] = None) -> Optiona
         "closed_reason": None if accepting else (b.get("inactiveReason") or None),
         "today_hours": hours,
         "services": b.get("facilities") or [],
+        "pickup": offers_pickup(b),
         "min_order_amount": b.get("minOrderAmount"),
     }
 
@@ -206,6 +213,7 @@ def get_items(product_ids: List[str], branch_id: str, detailed: bool = False) ->
         for p in product_db().products.find(
             {"_id": {"$in": oids}}, {"name": 1, "description": 1, "isDeal": 1, "image": 1, "categoryIds": 1}
         ).max_time_ms(QUERY_TIMEOUT_MS)
+        if not TEST_NAME.search(p.get("name") or "")  # dev test products ("Test Offer") never reach customers
     }
     assocs = {
         a["productId"]: a
@@ -401,6 +409,19 @@ def get_order(user_id: str, order_no: Optional[str] = None) -> Optional[dict]:
     if order_no:
         q["orderNo"] = order_no.strip()
     o = order_db().orders.find_one(q, _ORDER_FIELDS, sort=[("createdAt", -1)], max_time_ms=QUERY_TIMEOUT_MS)
+    return _order_summary(o, _branch_names([o]), detailed=True) if o else None
+
+
+def get_order_by_id(user_id: str, order_id: Optional[str] = None, order_no: Optional[str] = None) -> Optional[dict]:
+    """An order the bot placed, by the id the order backend returned (orders._id / orderId) or its order number.
+    Still scoped by customerId: an id alone never opens someone else's order."""
+    if not user_id or not (order_id or order_no):
+        return None
+    ids = [x for x in {order_id, _oid(order_id)} if x] if order_id else []
+    match = ([{"_id": {"$in": ids}}, {"orderId": {"$in": ids}}] if ids else []) + \
+        ([{"orderNo": order_no.strip()}] if order_no else [])
+    o = order_db().orders.find_one({"customerId": user_id, "$or": match}, _ORDER_FIELDS,
+                                   max_time_ms=QUERY_TIMEOUT_MS)
     return _order_summary(o, _branch_names([o]), detailed=True) if o else None
 
 

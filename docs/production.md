@@ -30,7 +30,7 @@ question), 1,359 (cart), 1,550 (payment), 1,938 (orders); unrecognised messages 
 4. **Every reply is checked before it is sent** (`app/agent/guards.py`): prices must appear in tool results;
    menu items mentioned must have been looked up; items presented in lists or bold must exist on the menu or in
    tool results (catches invented dishes like "Spaghetti"); branch/order claims need their tool; reply language.
-5. **One retry, then an honest fallback** in the customer's language, with whatever was really found as cards.
+5. **One retry, then an honest fallback** in the customer's language, with no item cards: cards only come with a real answer that gives them context.
 6. **Hard limits in code**: card numbers never reach the model; identity only from the JWT; order hand-off only
    on an explicit tap with a token tied to the exact cart.
 

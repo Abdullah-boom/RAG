@@ -1,7 +1,7 @@
 PY := .venv/bin/python
 UV := $(HOME)/.local/bin/uv
 
-.PHONY: setup index ui chat test api widget widget-dev check-token eval-rag eval
+.PHONY: setup index chat test api widget widget-dev check-token eval-rag eval
 
 setup:            ## create .venv on Python 3.12 and install pinned deps
 	$(UV) venv --python 3.12 .venv
@@ -9,9 +9,6 @@ setup:            ## create .venv on Python 3.12 and install pinned deps
 
 index:            ## rebuild the menu/FAQ search index from MongoDB
 	$(PY) -m app.ingestion.sync
-
-ui:               ## Streamlit chat UI on http://localhost:8501
-	.venv/bin/streamlit run ui.py
 
 chat:             ## terminal chat
 	$(PY) chat.py --branch gulberg --debug

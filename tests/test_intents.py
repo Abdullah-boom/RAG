@@ -72,10 +72,9 @@ def test_prefetched_cart_reaches_the_model_and_guard(monkeypatch):
     graph = g.build_graph(InMemorySaver())
     cfg = {"configurable": {"thread_id": "t", "user_id": None, "branch_id": "b1"}}
     out = graph.invoke({"messages": [g.HumanMessage(content="What's in my cart?")], "cart": cart}, config=cfg)
-    tool_msgs = [m for m in seen[0] if isinstance(m, ToolMessage)]
-    assert [m.name for m in tool_msgs] == ["view_cart"] and "1140" in tool_msgs[0].content
-    assert len(seen) == 1  # one model call: no extra round trip, and the guard accepted the answer
-    assert out["response"]["answer"].startswith("Your cart has 3 Reggy Burger")
+    # The cart is code's to state (the model once said "1 Crown Crust, Rs 2050" for a cart of 2, Rs 4,100).
+    assert seen == []  # no model call at all
+    assert out["response"]["answer"].startswith("Your cart:\n\n- 3 × Reggy Burger – Rs 1,140")
     assert out["response"]["cart_lines"] == cart
 
 
@@ -96,12 +95,15 @@ def _run_turn(monkeypatch, message, drafts):
     return out["response"], seen, graph.get_state(cfg).values
 
 
+ASKED = "branch kab tak khuli hai bhai"  # a reply the model still writes (cart replies are code's now)
+
+
 def test_roman_urdu_note_reaches_model_but_not_memory(monkeypatch):
-    english = "Your cart is empty right now, you can add items by telling me what you would like to order."
-    response, seen, state = _run_turn(monkeypatch, "cart dikhao", [english, english])
+    english = "Our I-8 branch is open right now, so you can place your order with us anytime you like today."
+    response, seen, state = _run_turn(monkeypatch, ASKED, [english, english])
     human = [m for m in seen[0] if isinstance(m, g.HumanMessage)][-1]
-    assert human.content == f"cart dikhao\n\n{g.REPLY_NOTES['roman_urdu']}"
-    assert [m.content for m in state["messages"] if isinstance(m, g.HumanMessage)] == ["cart dikhao"]
+    assert human.content == f"{ASKED}\n\n{g.REPLY_NOTES['roman_urdu']}"
+    assert [m.content for m in state["messages"] if isinstance(m, g.HumanMessage)] == [ASKED]
     # facts were verified and only the language stayed wrong after the retry: answer, don't fall back
     assert response["answer"] == english
 
@@ -113,9 +115,9 @@ def test_wrong_facts_still_fall_back(monkeypatch):
 
 
 def test_garbled_urdu_retry_falls_back_to_the_readable_draft(monkeypatch):
-    english = "Your cart is empty right now, you can add items by telling me what you would like to order."
-    garbled = "Ji, yہ رہی آپکی کارت۔ حالیے میں اس میں کچھ نہیں ہے۔ آپ کو اہم طور پر مہم کرتے ہے"
-    response, _, _ = _run_turn(monkeypatch, "cart dikhao", [english, garbled])
+    english = "Our I-8 branch is open right now, so you can place your order with us anytime you like today."
+    garbled = "Ji, yہ رہی آپکی برانچ۔ حالیے میں کھلی ہے۔ آپ کو اہم طور پر مہم کرتے ہے"
+    response, _, _ = _run_turn(monkeypatch, ASKED, [english, garbled])
     assert response["answer"] == english
 
 
@@ -135,7 +137,8 @@ def test_quality_words_that_are_not_recommendations(message, expected):
     assert [name for name, _ in prefetch_tools(message)] == expected
 
 
-def test_failed_turn_answers_in_customer_language_with_found_cards(monkeypatch):
+def test_failed_turn_shows_no_cards(monkeypatch):
+    """Cards only come with a real answer: a failed turn doesn't show what the tools found as if it were a pick."""
     import app.tools as tools_mod
     best = {"item_id": "p9", "name": "Stuff Crust Pizza", "type": "pizza", "available": True, "price": None,
             "price_from": 1530, "sizes": [{"size": "Regular", "price": 1530}]}
@@ -143,8 +146,7 @@ def test_failed_turn_answers_in_customer_language_with_found_cards(monkeypatch):
     monkeypatch.setattr(tools_mod.repo, "get_items", lambda ids, b, detailed=False: [dict(best)])
     invented = "Aap ke liye Chicken Tikka pizza Rs 999 aur Behari Kebab pizza Rs 888 hai, kaunsa add karun?"
     response, _, _ = _run_turn(monkeypatch, "koi achi cheez batao", [invented, invented])
-    assert response["answer"] == g.FOUND_FALLBACKS["roman_urdu"]
-    assert [c["name"] for c in response["items"]] == ["Stuff Crust Pizza"]
+    assert response["answer"] == g.FALLBACKS["roman_urdu"] and response["items"] == []
 
 
 def test_failed_turn_without_findings_is_localized(monkeypatch):
@@ -217,3 +219,16 @@ def test_choosing_a_shown_item_adds(message):
 ])
 def test_budget_questions_search_with_a_price_limit(message, args):
     assert prefetch_tools(message) == [("search_menu", args)]
+
+
+def test_model_down_shows_no_guessed_cards(monkeypatch):
+    """LLM unreachable and nothing code can answer itself: an honest "busy", never search results as cards."""
+    from app.tools import RequestContext
+    monkeypatch.setattr(g, "search_menu", lambda *a, **k: pytest.fail("no guessed search when the model is down"))
+    r = g._offline_response(RequestContext(None, "b"), "kuch spicy dikhao", {"language": "roman_urdu"})
+    assert r["answer"] == g.BUSY["roman_urdu"] and r["items"] == []
+
+
+def test_laga_do_is_an_add():
+    assert prefetch_tools("1 chicken tikka pizza laga do") == [
+        ("add_to_cart", {"items": [{"name": "chicken tikka pizza", "qty": 1}]})]

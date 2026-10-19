@@ -12,7 +12,7 @@ api._real_branches = api.branches  # the client fixture stubs branches(); DB-fai
 def client(monkeypatch):
     calls = []
 
-    def fake_chat(message, *, thread_id, branch_id, user_id=None, cart=None, payment_method=None):
+    def fake_chat(message, *, thread_id, branch_id, user_id=None, cart=None, payment_method=None, **_):
         calls.append({"message": message, "thread_id": thread_id, "branch_id": branch_id, "user_id": user_id})
         return {"answer": "Hi", "items": [], "suggestions": ["Show deals"], "cart": None, "handoff": False,
                 "as_of": "2026-10-13T00:00:00Z", "debug": {"tools": ["search_menu"]}}

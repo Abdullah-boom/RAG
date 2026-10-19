@@ -5,7 +5,15 @@ import type { Item } from "./api";
 import { priceLabel, rs } from "./format";
 
 type OnAdd = (item: Item, size?: string) => void;
-type Props = { message: Message; disabled: boolean; onRetry: (q: string) => void; onAdd: OnAdd };
+/** Confirm / Cancel under the bot's order summary (only the latest one, while nothing has changed). */
+export type ConfirmControls = { onConfirm: () => void; onCancel: () => void };
+type Props = {
+  message: Message;
+  disabled: boolean;
+  onRetry: (q: string) => void;
+  onAdd: OnAdd;
+  confirm?: ConfirmControls;
+};
 
 // react-markdown renders no raw HTML, so model output can't inject markup into the host page.
 const mdComponents = {
@@ -69,7 +77,7 @@ function ItemCard({ item, disabled, onAdd }: { item: Item; disabled: boolean; on
   );
 }
 
-export default function MessageView({ message, disabled, onRetry, onAdd }: Props) {
+export default function MessageView({ message, disabled, onRetry, onAdd, confirm }: Props) {
   const { role, text, items, error, retry } = message;
   return (
     <>
@@ -83,6 +91,16 @@ export default function MessageView({ message, disabled, onRetry, onAdd }: Props
           )}
         </div>
       </div>
+      {confirm && (
+        <div className="cz-confirm-row" role="group" aria-label="Place this order?">
+          <button className="cz-confirm-btn" onClick={confirm.onConfirm} disabled={disabled}>
+            Confirm order
+          </button>
+          <button className="cz-cancel-btn" onClick={confirm.onCancel} disabled={disabled}>
+            Cancel
+          </button>
+        </div>
+      )}
       {items && items.length > 0 && (
         <div className="cz-cards" role="list">
           {items.map((it) => (

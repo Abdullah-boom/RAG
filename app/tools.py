@@ -27,6 +27,8 @@ class RequestContext:
     branch_id: str
     user_message: Optional[str] = None  # the customer's own words this turn (the model rewrites queries)
     payment_method: Optional[str] = None  # the method already chosen for this branch's cart, if any
+    order: Optional[dict] = None  # the order type chosen for this cart: {"type": "DELIVERY"|"PICKUP", "lat"?, "lng"?}
+    tracked: tuple = ()  # orders the bot placed for this customer, newest first ({order_id, order_no, ...}); hidden
     offered: tuple = ()  # items shown to the customer last turn, in order ({item_id, name, type}): "the first one"
 
 
@@ -73,6 +75,10 @@ class NoArgs(Args):
 class OrderStatusArgs(Args):
     order_no: Optional[str] = Field(None, max_length=40,
                                     description="Order number like '170225-13665'. Omit for the latest order.")
+
+
+class OrderTypeArgs(Args):
+    order_type: str = Field(..., max_length=20, description="'delivery' or 'pickup' (takeaway / collect).")
 
 
 class OrderHistoryArgs(Args):
@@ -148,10 +154,17 @@ def search_menu(ctx: RequestContext, a: SearchMenuArgs) -> dict:
     exact = [i for i in items if _is_exact(i["name"], query_key)]
     if a.picked and exact:
         return {"as_of": utc_now_iso(), "match": "exact", "items": exact[: a.limit]}
+    said_fully = [i for i in items if ctx.user_message and cart.named_fully(i["name"], ctx.user_message, typos=False)]
+    if len({_name_key(i["name"]) for i in said_fully}) == 1:  # "cheese lover": that one item, not "Chicken Lover" too
+        return {"as_of": utc_now_iso(), "match": "exact", "items": said_fully[: a.limit]}
     # Only when the customer seems to NAME an item: budget / deal / description searches aren't names.
     words_note = {} if (a.max_price is not None or a.deals_only) else _customer_words_note(ctx, idx, items)
 
     if ctx.user_message and DESCRIPTION.search(ctx.user_message):  # suggestions for a wish, best matches first
+        from app.agent.understand import grounded  # the same check as the planner's path: only items that fit
+        items = grounded(a.query, items)
+        if not items:
+            return {"as_of": utc_now_iso(), "items": [], "note": "no_match"}
         return {"as_of": utc_now_iso(), "match": "suggestions", "items": items[: a.limit],
                 "note": "The customer described what they feel like, not an item name: present these as "
                         "suggestions that fit, without saying you couldn't find it."}
@@ -186,7 +199,8 @@ def _customer_words_note(ctx: RequestContext, idx, items: List[dict]) -> dict:
     if not said or DESCRIPTION.search(said):
         return {}
     said_words = set(_name_key(said).split())
-    if any(set(_name_key(i["name"]).split()) <= said_words for i in items):
+    if any(set(_name_key(i["name"]).split()) <= said_words or cart.named_fully(i["name"], said, typos=False)
+           for i in items):
         return {}
     fixed = idx.corrections(said)
     distinctive = {w for w in said_words if w not in GENERIC_WORDS and len(w) > 2 and not w.isdigit()}
@@ -226,14 +240,19 @@ class PaymentArgs(Args):
                                                        "e.g. 'cash on delivery', 'online card', 'COD'.")
 
 
+def _order_type(ctx: RequestContext) -> Optional[str]:
+    return (ctx.order or {}).get("type")
+
+
 def get_payment_methods(ctx: RequestContext, a: NoArgs, cart_lines: List[dict]):
-    """Methods this branch accepts now, each with the estimated tax and total for the current cart."""
+    """Methods this branch accepts now for this order type, each with the estimated tax and total for the cart."""
     subtotal = cart.price_cart(cart_lines, ctx.branch_id)["subtotal"] if cart_lines else 0
-    opts = payments.options(repo.get_payment_config(ctx.branch_id), subtotal)
-    result = {"methods": [{k: o[k] for k in ("code", "name", "when", "pay_now", "tax_rate", "tax", "total")}
-                          for o in opts],
+    opts = payments.options(repo.get_payment_config(ctx.branch_id), subtotal, _order_type(ctx))
+    result = {"order_type": _order_type(ctx),
+              "methods": [{k: o[k] for k in ("code", "name", "pay_now", "tax_rate", "tax", "total")} for o in opts],
               "cart_subtotal": subtotal, "chosen": ctx.payment_method, "note": payments.ESTIMATE_NOTE,
-              "secure_note": payments.SECURE_NOTE}
+              "secure_note": payments.SECURE_NOTE,
+              "next_step": "List these as a numbered list and ask the customer to reply with the one they want."}
     if not opts:
         result["error"] = "no_payment_methods"
     return result, cart_lines
@@ -242,42 +261,105 @@ def get_payment_methods(ctx: RequestContext, a: NoArgs, cart_lines: List[dict]):
 def set_payment_method(ctx: RequestContext, a: PaymentArgs, cart_lines: List[dict]):
     """Record the customer's choice for this branch's cart. Nothing is charged: the app's checkout does that."""
     config = repo.get_payment_config(ctx.branch_id)
-    chosen = payments.find(config, a.method)
+    kind = _order_type(ctx)
+    chosen = payments.find(config, a.method, kind)
     if not chosen:
-        several = payments.candidates(config, a.method)
+        several = payments.candidates(config, a.method, kind)
         if len(several) > 1:  # "card": at the door or online? Ask, don't guess.
             return {"error": "ambiguous_method", "requested": a.method,
                     "ask_which": [{"code": o["code"], "name": o["name"]} for o in several]}, cart_lines
-        return {"error": "unknown_or_unavailable_method", "requested": a.method,
-                "available": [{"code": o["code"], "name": o["name"]} for o in payments.options(config)]}, cart_lines
-    subtotal = cart.price_cart(cart_lines, ctx.branch_id)["subtotal"] if cart_lines else 0
+        available = [{"code": o["code"], "name": o["name"]} for o in payments.options(config, order_type=kind)]
+        other = payments.find(config, a.method)  # fine for the other order type: say why, not just "no"
+        if other and kind:
+            return {"error": "not_for_this_order_type", "requested": other["name"], "order_type": kind,
+                    "available": available}, cart_lines
+        return {"error": "unknown_or_unavailable_method", "requested": a.method, "available": available}, cart_lines
+    priced = cart.price_cart(cart_lines, ctx.branch_id) if cart_lines else None
+    subtotal = priced["subtotal"] if priced else 0
     est = payments.tax_estimate(subtotal, chosen["tax_rate"], config["tax_exclusive"])
-    return {"payment_method_selected": chosen["code"], "name": chosen["name"], "pay_now": chosen["pay_now"],
-            "cart_subtotal": subtotal, **est, "note": payments.ESTIMATE_NOTE,
-            "secure_note": payments.SECURE_NOTE}, cart_lines
+    out = {"payment_method_selected": chosen["code"], "name": chosen["name"], "pay_now": chosen["pay_now"],
+           "cart_subtotal": subtotal, **est, "note": payments.ESTIMATE_NOTE, "secure_note": payments.SECURE_NOTE}
+    if priced:  # with a cart, the next step is the order itself: ready -> the summary follows in the same reply
+        out["review"] = checkout.review(user_id=ctx.user_id, branch_status=repo.get_branch_status(ctx.branch_id),
+                                        cart=priced, payment_config=config, payment_code=chosen["code"],
+                                        order=ctx.order)
+    return out, cart_lines
 
 
 def review_order(ctx: RequestContext, a: NoArgs, cart_lines: List[dict]):
-    """Is the cart ready to order, and what's missing? The bot can't place it: the customer taps Confirm."""
+    """Is the cart ready to order, and what's missing? When ready, the customer's next "yes" places it (the API
+    does that, from code); the model never places orders."""
+    config = repo.get_payment_config(ctx.branch_id)
     result = checkout.review(user_id=ctx.user_id, branch_status=repo.get_branch_status(ctx.branch_id),
                              cart=cart.price_cart(cart_lines, ctx.branch_id) if cart_lines else None,
-                             payment_config=repo.get_payment_config(ctx.branch_id), payment_code=ctx.payment_method)
-    result["next_step"] = ("Ask the customer to tap 'Confirm order' in the cart to place it." if result["ready"]
+                             payment_config=config, payment_code=ctx.payment_method, order=ctx.order)
+    if any(p["code"] in PAYMENT_PROBLEMS for p in result["problems"]):
+        # Missing payment is the usual last step: offer the choices right away instead of a dead end.
+        result["payment_options"] = [{k: o[k] for k in ("code", "name", "pay_now", "tax_rate", "total")}
+                                     for o in payments.options(config, result["summary"]["subtotal"],
+                                                               _order_type(ctx))]
+    result["next_step"] = ("Show the summary and ask the customer to confirm." if result["ready"]
                            else "Explain each problem and how to fix it.")
     return result, cart_lines
 
 
+PAYMENT_PROBLEMS = {"no_payment_method", "payment_method_wrong_type", "payment_method_unavailable"}
+
+
+def set_order_type(ctx: RequestContext, a: OrderTypeArgs, cart_lines: List[dict]):
+    """Delivery or pickup. The API applies the change (it may need the customer's location for a delivery, or a
+    pickup branch when this one has no pickup); this only works out what the change needs."""
+    word = a.order_type.strip().lower()
+    wanted = (payments.PICKUP if any(w in word for w in ("pick", "take", "collect", "khud", "self"))
+              else payments.DELIVERY if any(w in word for w in ("deliver", "home", "ghar")) else None)
+    if not wanted:
+        return {"error": "say_delivery_or_pickup"}, cart_lines
+    current = _order_type(ctx)
+    out = {"order_type_selected": wanted, "previous": current}
+    if wanted == current:
+        return {**out, "unchanged": True}, cart_lines
+    if wanted == payments.PICKUP:
+        status = repo.get_branch_status(ctx.branch_id) or {}
+        if not status.get("pickup"):
+            out["needs"] = "pickup_branch"  # this branch has no pickup: the app lists the ones that do
+    else:
+        spot = ctx.order or {}
+        if spot.get("lat") is None or ctx.branch_id not in repo.branches_covering(spot["lat"], spot["lng"]):
+            out["needs"] = "location"  # the app asks for the location, then finds the branch that delivers there
+    if ctx.payment_method and not payments.fits(ctx.payment_method, wanted):
+        out["payment_cleared"] = payments.METHODS[ctx.payment_method]["name"]
+    return out, cart_lines
+
+
+TRACKED_PENDING = ("The order was sent to our ordering system and is waiting for the branch to accept it; "
+                   "it shows here with a status once accepted.")
+
+
+OWN_ORDERS_NOTE = ("These are the logged-in customer's OWN orders. If they asked about someone else's order, say you "
+                   "can only show their own orders, then answer about these.")
+
+
 def get_order_status(ctx: RequestContext, a: OrderStatusArgs) -> dict:
+    """The order number the customer gave; else the last order the bot placed for them (by the backend's hidden
+    id); else their latest order."""
     if not ctx.user_id:
         return {"error": "not_logged_in"}
+    if not a.order_no and ctx.tracked:
+        t = ctx.tracked[0]
+        o = repo.get_order_by_id(ctx.user_id, t.get("order_id"), t.get("order_no"))
+        if o:
+            return {"as_of": utc_now_iso(), "order": o, "placed_in_this_chat": True}
+        return {"as_of": utc_now_iso(), "placed_in_this_chat": True, "note": TRACKED_PENDING,
+                "order": {"status": "SUBMITTED", "placed_at": t.get("placed_at"), "order_type": t.get("order_type"),
+                          "branch": t.get("branch")}}
     o = repo.get_order(ctx.user_id, a.order_no)
-    return {"as_of": utc_now_iso(), "order": o} if o else {"error": "not_found"}
+    return {"as_of": utc_now_iso(), "order": o, "note": OWN_ORDERS_NOTE} if o else {"error": "not_found"}
 
 
 def get_order_history(ctx: RequestContext, a: OrderHistoryArgs) -> dict:
     if not ctx.user_id:
         return {"error": "not_logged_in"}
-    return {"as_of": utc_now_iso(), "orders": repo.get_order_history(ctx.user_id, a.limit)}
+    return {"as_of": utc_now_iso(), "orders": repo.get_order_history(ctx.user_id, a.limit), "note": OWN_ORDERS_NOTE}
 
 
 def search_faq(ctx: RequestContext, a: FaqArgs) -> dict:
@@ -346,16 +428,21 @@ TOOLS: Dict[str, Tool] = {t.name: t for t in [
     Tool("view_cart", cart.view_cart, cart.EmptyArgs,
          "Show the cart with live prices and subtotal.", uses_cart=True),
     Tool("clear_cart", cart.clear_cart, cart.EmptyArgs, "Empty the cart.", uses_cart=True),
+    Tool("set_quantity", cart.set_quantity, cart.SetQuantityArgs,
+         "Change how many of a cart line the customer wants (line number from view_cart, qty at least 1).",
+         uses_cart=True),
     Tool("get_payment_methods", get_payment_methods, NoArgs,
          "Payment methods this branch accepts (cash/card on delivery, online card/wallets), each with estimated "
          "tax and total for the current cart. Tax differs by method.", uses_cart=True),
     Tool("review_order", review_order, NoArgs,
-         "When the customer wants to place / confirm the order: checks the cart is ready (items, payment method, "
-         "branch open, minimum order, login) and returns the summary. You cannot place orders: if ready, the "
-         "customer taps 'Confirm order'.", uses_cart=True),
+         "When the customer wants to place / confirm the order: checks the cart is ready (items, delivery or "
+         "pickup, payment method, branch open, minimum order, login) and returns the summary. You cannot place "
+         "orders: if ready, the customer replies 'yes' to place it.", uses_cart=True),
     Tool("set_payment_method", set_payment_method, PaymentArgs,
          "Record how the customer wants to pay for this cart (they pay later in the app's checkout; nothing is "
          "charged here).", uses_cart=True),
+    Tool("set_order_type", set_order_type, OrderTypeArgs,
+         "Switch the order between delivery and pickup when the customer asks to.", uses_cart=True),
 ]}
 
 

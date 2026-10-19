@@ -6,8 +6,8 @@ import {
   type BranchStatus,
   type Cart,
   type Item,
-  type OrderReview,
-  type PaymentMethod,
+  type OrderTypeResponse,
+  type OrderView,
   type TokenProvider,
 } from "./api";
 import { load, save } from "./storage";
@@ -32,10 +32,11 @@ export type Message = {
   retry?: string; // the question to resend after an error
 };
 
-const STARTERS = ["Show deals", "Is my branch open?", "Kuch teekha 800 se kam"];
+const STARTERS = ["Show deals", "Kuch teekha 800 se kam", "Payment options"];
 const WELCOME =
   "Hi! Ask me about the menu, prices, deals or branch timings, in English, Roman Urdu or اردو. " +
-  "I can also build a cart for you.";
+  "I can build your cart, take your payment choice and place your order.";
+const PLACE_ORDER = "Place my order";
 
 let nextId = 1;
 const msg = (m: Omit<Message, "id">): Message => ({ id: nextId++, ...m });
@@ -54,7 +55,8 @@ function errorText(e: unknown): string {
   return "Something went wrong on our side. Please try again.";
 }
 
-type Phase = "locating" | "picking" | "ready";
+// choosing: delivery or pickup? locating: finding the branch that delivers to the customer. picking: a pickup branch.
+type Phase = "choosing" | "locating" | "picking" | "ready";
 
 const LOCATION_TIMEOUT_MS = 10_000;
 
@@ -72,8 +74,16 @@ function currentPosition(): Promise<GeolocationPosition> {
 
 function locationErrorText(e: unknown): string {
   const code = (e as GeolocationPositionError)?.code;
-  if (code === 1) return "Location is off for this site, so pick your branch below.";
-  return "We couldn't get your location, so pick your branch below.";
+  if (code === 1) return "Location is off for this site. Turn it on for delivery, or choose pickup.";
+  return "We couldn't get your location for delivery. Try again, or choose pickup.";
+}
+
+function orderTypeErrorText(e: unknown): string {
+  const code = e instanceof ApiError ? e.message : "";
+  if (code === "no_coverage") return "We don't deliver to your current location yet. You can choose pickup instead.";
+  if (code === "branch_closed") return "That branch is closed right now. Please choose another option.";
+  if (code === "pickup_not_offered") return "That branch doesn't offer pickup. Please pick another branch.";
+  return errorText(e);
 }
 
 export default function App({ config }: { config: WidgetConfig }) {
@@ -89,10 +99,10 @@ export default function App({ config }: { config: WidgetConfig }) {
   );
   const [open, setOpen] = useState(false);
   const [branch, setBranch] = useState<Branch | null>(null);
-  const [phase, setPhase] = useState<Phase>("picking");
-  const [notice, setNotice] = useState<string | null>(null); // why the picker is showing
-  const [nearby, setNearby] = useState<string[]>([]); // branches delivering to the customer's spot
+  const [phase, setPhase] = useState<Phase>("choosing");
+  const [notice, setNotice] = useState<string | null>(null); // why the chooser / picker is showing
   const [switching, setSwitching] = useState(false);
+  const [order, setOrder] = useState<OrderView | null>(null); // delivery / pickup and payment, shown like the cart
   const [status, setStatus] = useState<BranchStatus | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -101,10 +111,9 @@ export default function App({ config }: { config: WidgetConfig }) {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<string | null>(null);
   const [cartOpen, setCartOpen] = useState(false);
-  const [payMethods, setPayMethods] = useState<PaymentMethod[] | null>(null);
-  const [review, setReview] = useState<OrderReview | null>(null);
-  const [ordering, setOrdering] = useState(false);
   const [input, setInput] = useState("");
+  // The bot message whose order summary can be confirmed with the buttons; any other step clears it.
+  const [confirmId, setConfirmId] = useState<number | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // Every branch decision (location on open, or a manual pick) takes a new number; a reply that arrives
@@ -118,6 +127,7 @@ export default function App({ config }: { config: WidgetConfig }) {
   // Conversation only: the cart belongs to the branch and survives a new chat.
   const resetConversation = useCallback(() => {
     setSessionId(null);
+    setConfirmId(null);
     setMessages([msg({ role: "assistant", text: WELCOME })]);
     setSuggestions(STARTERS);
   }, []);
@@ -142,72 +152,74 @@ export default function App({ config }: { config: WidgetConfig }) {
     [api, resetConversation],
   );
 
-  /** Switch to a branch through the server (it refuses closed ones) and load that branch's own cart. */
-  const activate = useCallback(
-    async (b: Branch, ticket: number, manual: boolean) => {
-      setSwitching(true);
-      try {
-        const r = await api.select(b.branch_id);
-        if (decision.current !== ticket) return;
-        setBranch(r.branch);
-        setStatus(r.status);
-        setCart(r.cart);
+  /** The server set the order type and branch: show that branch, its cart and the order choices. */
+  const applyOrder = useCallback(
+    (r: OrderTypeResponse, ticket: number) => {
+      const changedBranch = branchRef.current?.branch_id !== r.branch.branch_id;
+      setBranch(r.branch);
+      setStatus(r.status);
+      setCart(r.cart);
+      setOrder(r.order);
+      setNotice(null);
+      setPhase("ready");
+      save("branch", r.branch.branch_id); // only shown as "last used" in the picker
+      if (changedBranch) {
         setCartOpen(false);
-        setNotice(null);
-        setPhase("ready");
-        save("branch", r.branch.branch_id); // only shown as "last used" in the picker
-        restoreConversation(r.branch, ticket);
-      } catch (e) {
-        if (decision.current !== ticket) return;
-        const closed = e instanceof ApiError && e.status === 409;
-        setNotice(
-          closed
-            ? `${b.name} is closed right now. Please pick an open branch.`
-            : manual
-              ? errorText(e)
-              : "We couldn't open your nearest branch, so pick one below.",
-        );
-        setPhase("picking");
-      } finally {
-        if (decision.current === ticket) setSwitching(false);
+        restoreConversation(r.branch, ticket); // conversations are per branch
       }
     },
-    [api, restoreConversation],
+    [restoreConversation],
   );
 
-  /** On every open: default to the branch whose delivery area contains the customer, if any is open. */
-  const chooseByLocation = useCallback(async () => {
+  /** Delivery / pickup couldn't be set: back to the chooser with the reason (the current order, if any, stays;
+   *  "Back to chat" returns to it). */
+  const failSwitch = useCallback((text: string) => {
+    setNotice(text);
+    setPhase("choosing");
+  }, []);
+
+  /** Delivery: the branch whose delivery area contains the customer's current location. */
+  const startDelivery = useCallback(async () => {
     const ticket = ++decision.current;
+    const from = branchRef.current?.branch_id ?? null;
     setPhase("locating");
     setNotice(null);
     let pos: GeolocationPosition;
     try {
       pos = await currentPosition();
     } catch (e) {
-      if (decision.current !== ticket) return;
-      setNearby([]);
-      setNotice(locationErrorText(e));
-      setPhase("picking");
+      if (decision.current === ticket) failSwitch(locationErrorText(e));
       return;
     }
     if (decision.current !== ticket) return;
     try {
-      const r = await api.locate(pos.coords.latitude, pos.coords.longitude);
-      if (decision.current !== ticket) return;
-      setNearby(r.covering.map((b) => b.branch_id));
-      if (r.branch) return void activate(r.branch, ticket, false);
-      setNotice(
-        r.reason === "branch_closed"
-          ? "The branch that delivers to you is closed right now. You can pick another open branch."
-          : "No branch delivers to your current location. You can still pick a branch below.",
-      );
-      setPhase("picking");
-    } catch {
-      if (decision.current !== ticket) return;
-      setNotice("We couldn't find your branch automatically, so pick one below.");
-      setPhase("picking");
+      const r = await api.setOrderType("DELIVERY", {
+        lat: pos.coords.latitude,
+        lng: pos.coords.longitude,
+        from_branch_id: from,
+      });
+      if (decision.current === ticket) applyOrder(r, ticket);
+    } catch (e) {
+      if (decision.current === ticket) failSwitch(orderTypeErrorText(e));
     }
-  }, [api, activate]);
+  }, [api, applyOrder, failSwitch]);
+
+  /** Pickup: the customer picks one of the open branches that offer it. */
+  const choosePickupBranch = useCallback(
+    async (b: Branch) => {
+      const ticket = ++decision.current;
+      setSwitching(true);
+      try {
+        const r = await api.setOrderType("PICKUP", { branch_id: b.branch_id, from_branch_id: branchRef.current?.branch_id });
+        if (decision.current === ticket) applyOrder(r, ticket);
+      } catch (e) {
+        if (decision.current === ticket) setNotice(orderTypeErrorText(e));
+      } finally {
+        if (decision.current === ticket) setSwitching(false);
+      }
+    },
+    [api, applyOrder],
+  );
 
   // Page API for the host site / app:
   //   open(), close()   e.g. from an "Ask us" button
@@ -230,48 +242,32 @@ export default function App({ config }: { config: WidgetConfig }) {
         if (wasLoggedIn !== (tokenRef.current !== null)) {
           forget();
           const b = branchRef.current;
-          if (b) api.cartGet(b.branch_id).then((r) => isCurrent(b.branch_id) && setCart(r.cart), () => setCart(null));
+          if (b)
+            api.cartGet(b.branch_id).then(
+              (r) => {
+                if (!isCurrent(b.branch_id)) return;
+                setCart(r.cart);
+                setOrder(r.order);
+              },
+              () => setCart(null),
+            );
         }
       },
     };
   }, [api, resetConversation]);
 
-  // Each time the panel opens, the default branch is worked out again from where the customer is now.
+  // The first question on opening: delivery or pickup? (Kept while the page is open; changeable any time.)
   useEffect(() => {
-    if (open) void chooseByLocation();
-  }, [open, chooseByLocation]);
+    if (open && !branchRef.current) setPhase("choosing");
+  }, [open]);
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, busy]);
 
-  // A review is for one exact cart: any change (items, payment, branch) means review again.
-  useEffect(() => setReview(null), [cart, branch]);
-
-  // Payment options for the open cart; estimates depend on the subtotal, so reload when it changes.
-  const subtotal = cart?.subtotal ?? null;
-  useEffect(() => {
-    if (!cartOpen || !branch) return;
-    const branchId = branch.branch_id;
-    setPayMethods(null);
-    api.paymentMethods(branchId).then(
-      (r) => isCurrent(branchId) && setPayMethods(r.methods),
-      () => isCurrent(branchId) && setPayMethods([]),
-    );
-  }, [api, cartOpen, branch, subtotal]);
-
   useEffect(() => {
     if (open && phase === "ready") inputRef.current?.focus();
   }, [open, phase]);
-
-  function chooseBranch(b: Branch) {
-    const ticket = ++decision.current; // a manual pick wins over a location lookup still in flight
-    if (b.branch_id === branch?.branch_id && phase === "picking" && !notice) {
-      setPhase("ready");
-      return;
-    }
-    void activate(b, ticket, true);
-  }
 
   async function send(text: string) {
     const question = text.trim();
@@ -279,6 +275,7 @@ export default function App({ config }: { config: WidgetConfig }) {
     const b = branch;
     setInput("");
     setSuggestions([]);
+    setConfirmId(null); // a typed "yes" still works (the server checks it); the buttons belong to the summary only
     setMessages((m) => [...m.filter((x) => !x.error), msg({ role: "user", text: question })]);
     setBusy(true);
     setProgress(null);
@@ -287,15 +284,24 @@ export default function App({ config }: { config: WidgetConfig }) {
       save(`session:${b.branch_id}`, r.session_id);
       if (!isCurrent(b.branch_id)) return; // switched branch while this was running
       setSessionId(r.session_id);
-      setMessages((m) => [...m, msg({ role: "assistant", text: r.answer, items: r.items })]);
+      const reply = msg({ role: "assistant", text: r.answer, items: r.items });
+      setMessages((m) => [...m, reply]);
+      setConfirmId(r.confirm ? reply.id : null);
       setSuggestions(r.suggestions);
       setCart(r.cart);
+      if (r.order) setOrder(r.order);
+      // A switch the bot can't finish alone: delivery needs the location, pickup here may need another branch.
+      if (r.action?.type === "need_location") void startDelivery();
+      else if (r.action?.type === "pick_pickup_branch") {
+        setNotice(`${b.name} doesn't offer pickup. Pick a branch for pickup:`);
+        setPhase("picking");
+      }
     } catch (e) {
       if (e instanceof ApiError && e.message === "unknown_branch") {
         // branch was closed down or removed since the panel opened: ask again
         setBranch(null);
-        setNotice("That branch isn't available any more. Please pick another.");
-        setPhase("picking");
+        setNotice("That branch isn't available any more. Please choose delivery or pickup again.");
+        setPhase("choosing");
         return;
       }
       setMessages((m) => [...m, msg({ role: "assistant", text: errorText(e), error: true, retry: question })]);
@@ -325,6 +331,7 @@ export default function App({ config }: { config: WidgetConfig }) {
     const r = await call(branchId);
     if (!isCurrent(branchId)) return null;
     setCart(r.cart);
+    setConfirmId(null); // the summary was for the cart as it was
     return r;
   }
 
@@ -376,66 +383,34 @@ export default function App({ config }: { config: WidgetConfig }) {
     }
   }
 
-  async function choosePayment(code: string) {
+  /** Confirm order / Cancel under the summary: the customer's own tap, sent straight to the server. */
+  async function answerSummary(answer: "yes" | "no") {
+    if (!branch || !sessionId || busy) return;
+    const b = branch;
+    setConfirmId(null);
+    setSuggestions([]);
+    setMessages((m) => [...m, msg({ role: "user", text: answer === "yes" ? "Confirm order" : "Cancel" })]);
+    setBusy(true);
+    setProgress(answer === "yes" ? "Placing your order…" : null);
     try {
-      await cartCall((b) => api.setPayment(b, code));
+      const r = await api.chatConfirm(b.branch_id, sessionId, answer);
+      if (!isCurrent(b.branch_id)) return;
+      const reply = msg({ role: "assistant", text: r.answer });
+      setMessages((m) => [...m, reply]);
+      setConfirmId(r.confirm ? reply.id : null);
+      setSuggestions(r.suggestions);
+      setCart(r.cart);
+      if (r.order) setOrder(r.order);
     } catch (e) {
       say(
-        e instanceof ApiError && e.status === 409
-          ? "That payment option isn't available at this branch right now. Please pick another."
+        e instanceof ApiError && e.message === "nothing_to_confirm"
+          ? "That summary is out of date. Say “place my order” to see your order again."
           : errorText(e),
         true,
       );
-    }
-  }
-
-  async function reviewOrder() {
-    if (!branch) return;
-    if (!cart?.lines.length) {
-      say("Your cart is empty. Add something first, then you can review and confirm your order.");
-      return;
-    }
-    const branchId = branch.branch_id;
-    setCartOpen(true);
-    try {
-      const r = await api.reviewOrder(branchId);
-      if (isCurrent(branchId)) setReview(r);
-    } catch (e) {
-      say(errorText(e), true);
-    }
-  }
-
-  /** The customer's explicit tap: hand the cart to the order backend and show what it answered. */
-  async function confirmOrder() {
-    if (!branch || !review?.confirm_token || ordering) return;
-    const branchId = branch.branch_id;
-    setOrdering(true);
-    try {
-      const r = await api.confirmOrder(branchId, review.confirm_token);
-      if (!isCurrent(branchId)) return;
-      setCart(r.cart);
-      setReview(null);
-      if (r.status === "placed") {
-        setCartOpen(false);
-        say(`Your order is placed${r.order_no ? ` (order ${r.order_no})` : ""}. ${r.message ?? "You can track it in the app."}`);
-        setSuggestions(["Where is my order?"]);
-      } else if (r.status === "not_connected") {
-        say("Your cart and payment choice are saved. Please complete your order in the app to place it.");
-      } else if (r.status === "rejected") {
-        say(r.message ?? "The order couldn't be placed. Please check your cart and try again.", true);
-      } else {
-        say("We couldn't reach our ordering system. Your cart is saved, so please try again in a moment.", true);
-      }
-    } catch (e) {
-      const code = e instanceof ApiError ? e.message : "";
-      if (code === "cart_changed" || code === "expired") {
-        say("Your cart changed since you reviewed it. Please review it again before confirming.", true);
-        setReview(null);
-      } else {
-        say(errorText(e), true);
-      }
     } finally {
-      setOrdering(false);
+      setBusy(false);
+      setProgress(null);
     }
   }
 
@@ -468,7 +443,7 @@ export default function App({ config }: { config: WidgetConfig }) {
             <div className="cz-header-text">
               <div className="cz-title">{config.title}</div>
               {branch && phase === "ready" && (
-                <button className="cz-branch" onClick={() => setPhase("picking")} title="Change branch">
+                <button className="cz-branch" onClick={() => setPhase("choosing")} title="Change delivery / pickup">
                   <span className={`cz-dot ${status ? (status.open_now ? "is-open" : "is-closed") : ""}`} />
                   {branch.name}
                   {status && <span className="cz-muted"> · {status.open_now ? "open now" : "closed now"}</span>}
@@ -490,7 +465,40 @@ export default function App({ config }: { config: WidgetConfig }) {
             </button>
           </header>
 
-          {phase === "locating" ? (
+          {phase === "choosing" ? (
+            <div className="cz-choose">
+              <div className="cz-bubble cz-choose-ask">How would you like to get your order?</div>
+              {notice && (
+                <div className="cz-notice" role="status">
+                  {notice}
+                </div>
+              )}
+              <div className="cz-choose-options">
+                <button
+                  className={`cz-choose-btn ${order?.type === "DELIVERY" ? "is-current" : ""}`}
+                  onClick={() => void startDelivery()}
+                >
+                  <strong>Delivery</strong>
+                  <span>To your current location</span>
+                </button>
+                <button
+                  className={`cz-choose-btn ${order?.type === "PICKUP" ? "is-current" : ""}`}
+                  onClick={() => {
+                    setNotice(null);
+                    setPhase("picking");
+                  }}
+                >
+                  <strong>Pickup</strong>
+                  <span>From an open branch</span>
+                </button>
+              </div>
+              {branch && (
+                <button className="cz-picker-cancel" onClick={() => { setNotice(null); setPhase("ready"); }}>
+                  Back to chat
+                </button>
+              )}
+            </div>
+          ) : phase === "locating" ? (
             <div className="cz-locating" role="status">
               <span className="cz-typing" aria-hidden>
                 <span />
@@ -502,25 +510,33 @@ export default function App({ config }: { config: WidgetConfig }) {
                 className="cz-link"
                 onClick={() => {
                   decision.current++; // stop waiting for the location
+                  setNotice(null);
                   setPhase("picking");
                 }}
               >
-                Pick a branch myself
+                Choose pickup instead
               </button>
             </div>
           ) : phase === "picking" || !branch ? (
             <BranchPicker
               api={api}
-              current={branch}
+              current={order?.type === "PICKUP" ? branch : null}
               notice={notice}
-              nearby={nearby}
               lastUsed={load("branch")}
               switching={switching}
-              onPick={chooseBranch}
-              onCancel={branch ? () => { setNotice(null); setPhase("ready"); } : undefined}
+              onPick={(b) => void choosePickupBranch(b)}
+              onCancel={() => { setNotice(null); setPhase(branch ? "ready" : "choosing"); }}
             />
           ) : (
             <>
+              <div className="cz-orderbar" aria-label="Your order">
+                <span>
+                  <strong>{order?.type_name ?? "Delivery or pickup?"}</strong> · {branch.name}
+                </span>
+                <span className={order?.payment_method ? "" : "cz-muted"}>
+                  {order?.payment_method ? `Pay: ${order.payment_method.name}` : "Payment not chosen"}
+                </span>
+              </div>
               <div className="cz-messages" ref={listRef} aria-live="polite">
                 {messages.map((m) => (
                   <MessageView
@@ -529,6 +545,11 @@ export default function App({ config }: { config: WidgetConfig }) {
                     disabled={busy}
                     onRetry={retry}
                     onAdd={(item, size) => void addToCart(item, size)}
+                    confirm={
+                      m.id === confirmId
+                        ? { onConfirm: () => void answerSummary("yes"), onCancel: () => void answerSummary("no") }
+                        : undefined
+                    }
                   />
                 ))}
                 {busy && (
@@ -553,7 +574,7 @@ export default function App({ config }: { config: WidgetConfig }) {
                       className="cz-chip"
                       dir="auto"
                       onClick={() =>
-                        void (/^show my cart$/i.test(s) ? showCart() : /^review & confirm/i.test(s) ? reviewOrder() : send(s))
+                        void (/^show my cart$/i.test(s) ? showCart() : send(s))
                       }
                     >
                       {s}
@@ -566,15 +587,14 @@ export default function App({ config }: { config: WidgetConfig }) {
                 <CartBar
                   cart={cart}
                   expanded={cartOpen}
+                  busy={busy}
                   onToggle={() => setCartOpen((o) => !o)}
                   onClear={clearCart}
-                  methods={payMethods}
                   onQty={(n, qty) => void changeQty(n, qty)}
-                  onPay={(code) => void choosePayment(code)}
-                  review={review}
-                  ordering={ordering}
-                  onReview={() => void reviewOrder()}
-                  onConfirm={() => void confirmOrder()}
+                  onPlace={() => {
+                    setCartOpen(false);
+                    void send(PLACE_ORDER);
+                  }}
                 />
               )}
 
@@ -607,7 +627,7 @@ export default function App({ config }: { config: WidgetConfig }) {
                   </svg>
                 </button>
               </form>
-              <div className="cz-footer">Answers use live menu prices. Orders are placed in the app.</div>
+              <div className="cz-footer">Live menu prices. An order is placed only when you reply “yes” to its summary.</div>
             </>
           )}
         </section>

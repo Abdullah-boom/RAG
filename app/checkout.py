@@ -3,8 +3,11 @@ cart is ready, the customer explicitly confirms, and it hands the cart state to 
 (ORDER_BACKEND_URL), which places the order, takes any payment in its own flow and answers with a status.
 
 Review -> confirm is two steps on purpose: review returns a short-lived confirm token signed over exactly
-that cart and payment choice, so a cart changed after the customer saw the summary can't be confirmed, and
-a double tap sends one order (the token is also the backend's idempotency key).
+that cart, order type and payment choice, so an order changed after the customer saw the summary can't be
+confirmed, and a double "yes" sends one order (the token is also the backend's idempotency key).
+
+The backend answers with its own order id (and order number, if it has one yet). The API keeps those server
+side (cart_store.add_placed) so the bot can track the order later; the customer is never shown the id.
 """
 import hashlib
 import hmac
@@ -34,9 +37,18 @@ FAILED = "failed"                 # backend unreachable / error: safe to try aga
 # ---------- review ----------
 
 def review(*, user_id: Optional[str], branch_status: Optional[dict], cart: Optional[dict],
-           payment_config: Optional[dict], payment_code: Optional[str]) -> dict:
-    """Is this cart ready to order? `cart` is a priced cart (app/cart.py price_cart) or None."""
+           payment_config: Optional[dict], payment_code: Optional[str], order: Optional[dict] = None) -> dict:
+    """Is this cart ready to order? `cart` is a priced cart (app/cart.py price_cart) or None; `order` is the
+    stored order type ({"type": "DELIVERY" | "PICKUP", "lat"?, "lng"?}) or None."""
     problems: List[dict] = []
+    order_type = (order or {}).get("type")
+    if order_type not in payments.ORDER_TYPES:
+        problems.append({"code": "no_order_type"})
+        order_type = None
+    elif order_type == payments.PICKUP and branch_status and not branch_status.get("pickup", True):
+        problems.append({"code": "pickup_not_offered"})
+    elif order_type == payments.DELIVERY and (order.get("lat") is None or order.get("lng") is None):
+        problems.append({"code": "no_delivery_location"})
     if not cart or not cart["lines"]:
         problems.append({"code": "empty_cart"})
     else:
@@ -49,22 +61,28 @@ def review(*, user_id: Optional[str], branch_status: Optional[dict], cart: Optio
     minimum = (branch_status or {}).get("min_order_amount")
     if cart and cart["lines"] and minimum and subtotal < minimum:
         problems.append({"code": "below_minimum_order", "minimum": minimum, "subtotal": subtotal})
-    method = payments.checkout(payment_config, subtotal, payment_code)["payment_method"]
+    method = payments.checkout(payment_config, subtotal, payment_code, order_type)["payment_method"]
     if not payment_code:
         problems.append({"code": "no_payment_method"})
+    elif not payments.fits(payment_code, order_type):
+        problems.append({"code": "payment_method_wrong_type", "method": payment_code, "order_type": order_type})
     elif not method:
         problems.append({"code": "payment_method_unavailable", "method": payment_code})
     if not user_id:
         problems.append({"code": "login_required"})  # the order belongs to a customer account
     summary = {"lines": (cart or {}).get("lines", []), "subtotal": subtotal, "payment_method": method,
+               "order_type": order_type, "branch": (branch_status or {}).get("branch"),
                "note": payments.ESTIMATE_NOTE}
     return {"ready": not problems, "problems": problems, "summary": summary}
 
 
 # ---------- confirm token ----------
 
-def fingerprint(owner: str, branch_id: str, lines: List[dict], payment_code: Optional[str]) -> str:
+def fingerprint(owner: str, branch_id: str, lines: List[dict], payment_code: Optional[str],
+                order: Optional[dict] = None) -> str:
+    order = order or {}
     state = json.dumps({"o": owner, "b": branch_id, "p": payment_code,
+                        "t": [order.get("type"), order.get("lat"), order.get("lng")],
                         "l": [[l["item_id"], l.get("size"), l["qty"]] for l in lines]}, sort_keys=True)
     return hashlib.sha256(state.encode()).hexdigest()
 
@@ -90,10 +108,16 @@ def check_token(token: str, fp: str, now: Optional[float] = None) -> Optional[st
 
 # ---------- hand-off ----------
 
-def order_request(*, user_id: str, branch_id: str, lines: List[dict], payment_method: dict, token: str) -> dict:
-    """What the order backend receives: state only (ids, sizes, quantities, payment code), no payment data.
-    Prices are the backend's to set; the estimate is there so it can flag a mismatch."""
+def order_request(*, user_id: str, branch_id: str, lines: List[dict], payment_method: dict, token: str,
+                  order: Optional[dict] = None) -> dict:
+    """What the order backend receives: state only (ids, sizes, quantities, order type, payment code), no
+    payment data. Prices are the backend's to set; the estimate is there so it can flag a mismatch.
+    delivery_location is the spot the delivery branch was matched from; the app adds the street address."""
+    order = order or {}
+    delivery = order.get("type") == payments.DELIVERY and order.get("lat") is not None
     return {"source": "chatbot", "customer_id": user_id, "branch_id": branch_id,
+            "order_type": order.get("type"),
+            "delivery_location": {"lat": order["lat"], "lng": order["lng"]} if delivery else None,
             "items": [{"item_id": l["item_id"], "name": l["name"], "size": l.get("size"), "qty": l["qty"]}
                       for l in lines],
             "payment_method": payment_method["code"],
@@ -104,9 +128,10 @@ def order_request(*, user_id: str, branch_id: str, lines: List[dict], payment_me
 
 def submit(payload: dict, customer_auth: Optional[str]) -> dict:
     """Send the order to ORDER_BACKEND_URL. Expected reply (adjust here when the contract is fixed):
-    2xx JSON {status?, order_no | orderNo, message?}; 4xx = rejected with a message; else failed."""
+    2xx JSON {order_id | orderId | _id, order_no | orderNo ?, status?, message?}; 4xx = rejected with a
+    message; else failed. order_id is what the bot tracks the order by."""
     if not config.ORDER_BACKEND_URL:
-        return {"status": NOT_CONNECTED, "order_no": None, "message": None}
+        return {"status": NOT_CONNECTED, "order_id": None, "order_no": None, "message": None}
     headers = {"Idempotency-Key": payload["idempotency_key"]}
     if config.ORDER_BACKEND_KEY:
         headers["Authorization"] = f"Bearer {config.ORDER_BACKEND_KEY}"
@@ -116,7 +141,7 @@ def submit(payload: dict, customer_auth: Optional[str]) -> dict:
         r = httpx.post(config.ORDER_BACKEND_URL, json=payload, headers=headers, timeout=BACKEND_TIMEOUT_S)
     except httpx.HTTPError as e:
         log.warning("order backend unreachable: %s", type(e).__name__)
-        return {"status": FAILED, "order_no": None, "message": None}
+        return {"status": FAILED, "order_id": None, "order_no": None, "message": None}
     try:
         body = r.json() if r.content else {}
     except ValueError:
@@ -124,9 +149,11 @@ def submit(payload: dict, customer_auth: Optional[str]) -> dict:
     body = body if isinstance(body, dict) else {}
     message = body.get("message") if isinstance(body.get("message"), str) else None
     if r.is_success:
-        return {"status": PLACED, "order_no": body.get("order_no") or body.get("orderNo"),
+        order_id = body.get("order_id") or body.get("orderId") or body.get("_id")
+        return {"status": PLACED, "order_id": str(order_id) if order_id else None,
+                "order_no": body.get("order_no") or body.get("orderNo"),
                 "backend_status": body.get("status"), "message": message}
     if 400 <= r.status_code < 500:
-        return {"status": REJECTED, "order_no": None, "message": message}
+        return {"status": REJECTED, "order_id": None, "order_no": None, "message": message}
     log.warning("order backend error %s", r.status_code)
-    return {"status": FAILED, "order_no": None, "message": None}
+    return {"status": FAILED, "order_id": None, "order_no": None, "message": None}

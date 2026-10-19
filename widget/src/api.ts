@@ -78,7 +78,20 @@ export type Branch = {
   city: string | null;
   open_now: boolean; // only open branches can be selected
   accepting_orders: boolean;
+  pickup: boolean; // offers pickup (every branch delivers)
 };
+
+export type OrderType = "DELIVERY" | "PICKUP";
+
+/** The customer's order choices, shown like the cart. Changed in chat or by choosing delivery / pickup. */
+export type OrderView = {
+  type: OrderType | null;
+  type_name: string | null;
+  payment_method: { code: string; name: string } | null;
+};
+
+/** Something the app must do before a switch asked for in chat can happen. */
+export type ChatAction = { type: "need_location" | "pick_pickup_branch"; order_type: OrderType };
 
 /** Where the device is, as a default branch. branch is null unless reason is "matched". */
 export type LocateResponse = {
@@ -87,7 +100,15 @@ export type LocateResponse = {
   covering: Branch[]; // branches whose delivery area contains the point, best first
 };
 
-export type SelectResponse = { branch: Branch; status: BranchStatus; guest_id: string | null; cart: Cart | null };
+export type SelectResponse = {
+  branch: Branch;
+  status: BranchStatus;
+  guest_id: string | null;
+  cart: Cart | null;
+  order: OrderView;
+};
+
+export type OrderTypeResponse = SelectResponse & { cart_moved: boolean };
 
 export type BranchStatus = {
   branch_id: string;
@@ -106,6 +127,9 @@ export type ChatResponse = {
   cart: Cart | null;
   handoff: boolean;
   as_of: string;
+  order: OrderView | null;
+  action: ChatAction | null;
+  confirm: boolean; // an order summary: show Confirm / Cancel (the server holds the confirm token)
 };
 
 export type CartActionResponse = {
@@ -121,6 +145,7 @@ export type SessionResponse = {
   session_id: string;
   messages: { role: "user" | "assistant"; text: string }[];
   cart: Cart | null;
+  order: OrderView;
 };
 
 export class ApiError extends Error {
@@ -137,7 +162,8 @@ export type TokenProvider = () => string | null | undefined | Promise<string | n
 
 async function failure(res: Response): Promise<ApiError> {
   const detail = await res.json().then((j) => j.detail, () => res.statusText);
-  return new ApiError(res.status, typeof detail === "string" ? detail : res.statusText);
+  const code = typeof detail === "string" ? detail : typeof detail?.code === "string" ? detail.code : res.statusText;
+  return new ApiError(res.status, code);
 }
 
 /** Minimal Server-Sent Events reader for a fetch() body (EventSource can't POST or send headers). */
@@ -247,14 +273,24 @@ export function createApi(baseUrl: string, getToken: TokenProvider = () => null,
       request<BranchStatus>(`/api/branches/${encodeURIComponent(branchId)}/status`),
     /** Default branch for these coordinates (from the branches' delivery areas). */
     locate: (lat: number, lng: number) => post<LocateResponse>("/api/branches/locate", { lat, lng }),
+    /** Delivery (from the device's location) or pickup (from a branch). Sets the branch; 409 codes:
+     *  no_coverage, branch_closed, pickup_not_offered. from_branch_id: its cart comes along. */
+    setOrderType: (
+      orderType: OrderType,
+      where: { lat?: number; lng?: number; branch_id?: string; from_branch_id?: string | null },
+    ) => post<OrderTypeResponse>("/api/order/type", { order_type: orderType, ...where }),
     /** Switch branch: the server refuses closed ones (409 branch_closed) and returns that branch's cart. */
     select: (branchId: string) => post<SelectResponse>("/api/branches/select", { branch_id: branchId }),
     session: (branchId: string, sessionId: string) =>
       request<SessionResponse>(`/api/session?${q({ branch_id: branchId, session_id: sessionId })}`),
     chatStream,
+    /** The Confirm order / Cancel buttons under the summary: same as typing yes / no, never through the model.
+     *  409 nothing_to_confirm when the summary no longer stands. */
+    chatConfirm: (branchId: string, sessionId: string, answer: "yes" | "no") =>
+      post<ChatResponse>("/api/chat/confirm", { branch_id: branchId, session_id: sessionId, answer }),
     // Cart: one per branch, separate from the chat. Direct data calls, no LLM.
     cartGet: (branchId: string) =>
-      request<{ guest_id: string | null; cart: Cart | null }>(`/api/cart?${q({ branch_id: branchId })}`),
+      request<{ guest_id: string | null; cart: Cart | null; order: OrderView }>(`/api/cart?${q({ branch_id: branchId })}`),
     cartAdd: (branchId: string, itemId: string, size?: string | null) =>
       post<CartActionResponse>("/api/cart/add", { branch_id: branchId, item_id: itemId, size: size ?? null, qty: 1 }),
     cartQuantity: (branchId: string, lineNo: number, qty: number) =>
@@ -265,7 +301,8 @@ export function createApi(baseUrl: string, getToken: TokenProvider = () => null,
     // Payment: choose how to pay for this branch's cart (paid later in the app's checkout; never card details here).
     paymentMethods: (branchId: string) =>
       request<PaymentMethodsResponse>(`/api/payment-methods?${q({ branch_id: branchId })}`),
-    // Ordering: the bot never places orders. Review, then the customer's explicit Confirm hands it to the order backend.
+    // Ordering for apps with their own Confirm button. The widget orders in chat: the bot shows the summary and the
+    // customer's "yes" places it.
     reviewOrder: (branchId: string) => post<OrderReview>("/api/checkout/review", { branch_id: branchId }),
     confirmOrder: (branchId: string, token: string) =>
       post<OrderResult>("/api/checkout/confirm", { branch_id: branchId, confirm_token: token }),

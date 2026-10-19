@@ -26,8 +26,12 @@ def client(monkeypatch):
     return TestClient(api.app)
 
 
-def ready_cart(client, branch=A["branch_id"], method="COD"):
+SPOT = {"type": "DELIVERY", "lat": 33.6, "lng": 73.0}
+
+
+def ready_cart(client, branch=A["branch_id"], method="COD", order=SPOT):
     add(client, branch)  # Bazinga Rs 540
+    api.cart_store().set_order(f"user:{USER}", branch, order)
     client.post("/api/cart/payment", json={"branch_id": branch, "method": method}, headers=guest(GUEST_1))
 
 
@@ -58,7 +62,7 @@ def backend(monkeypatch, reply):
 def test_review_lists_everything_missing(client, monkeypatch):
     monkeypatch.setattr(api, "user_from_request", lambda request: None)
     codes = {p["code"] for p in review(client)["problems"]}
-    assert codes == {"empty_cart", "no_payment_method", "login_required"}
+    assert codes == {"empty_cart", "no_order_type", "no_payment_method", "login_required"}
 
 
 def test_review_ready_returns_summary_and_token(client):
@@ -94,14 +98,17 @@ def test_placed_hands_off_state_only_and_empties_that_cart(client, monkeypatch):
     ready_cart(client, branch=B["branch_id"])
     token = review(client)["confirm_token"]
     r = confirm(client, token).json()
-    assert r["status"] == "placed" and r["order_no"] == "CHZ-1042" and r["cart"] is None
+    assert r["status"] == "placed" and r["cart"] is None
+    assert "order_no" not in r and "order_id" not in r  # kept server side for the bot's tracking only
+    assert api.cart_store().placed_orders(f"user:{USER}")[0]["order_no"] == "CHZ-1042"
     body = sent[0]["json"]
     assert body["customer_id"] == USER and body["branch_id"] == A["branch_id"] and body["payment_method"] == "COD"
     assert body["items"] == [{"item_id": "p1", "name": "Bazinga Burger", "size": None, "qty": 1}]
     assert sent[0]["headers"]["Idempotency-Key"] == token
     # state only: these fields and nothing else (no prices to trust, no payment data)
-    assert set(body) == {"source", "customer_id", "branch_id", "items", "payment_method", "estimate",
-                         "idempotency_key"}
+    assert set(body) == {"source", "customer_id", "branch_id", "order_type", "delivery_location", "items",
+                         "payment_method", "estimate", "idempotency_key"}
+    assert body["order_type"] == "DELIVERY" and body["delivery_location"] == {"lat": 33.6, "lng": 73.0}
     # the other branch's cart is untouched
     assert client.get(f"/api/cart?branch_id={B['branch_id']}", headers=guest(GUEST_1)).json()["cart"]["item_count"] == 1
 
@@ -119,7 +126,8 @@ def test_cart_changed_after_review_is_refused(client, monkeypatch):
 
 def test_expired_or_forged_token(client):
     ready_cart(client)
-    fp = checkout.fingerprint(f"user:{USER}", A["branch_id"], [{"item_id": "p1", "size": None, "qty": 1}], "COD")
+    fp = checkout.fingerprint(f"user:{USER}", A["branch_id"], [{"item_id": "p1", "size": None, "qty": 1}], "COD",
+                              SPOT)
     old = checkout.make_token(fp, now=0)
     assert confirm(client, old).json()["detail"] == "expired"
     assert confirm(client, "123.forged").json()["detail"] == "cart_changed"

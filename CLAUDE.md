@@ -5,12 +5,13 @@ English, Roman Urdu and Urdu script. README.md is the full reference (API table,
 
 ## Layout
 
-- `app/api.py`: FastAPI backend for the website widget. Its module docstring explains identity, carts, payment and checkout.
+- `app/api.py`: FastAPI backend for the website widget. Its module docstring explains identity, carts, delivery/pickup,
+  payment and checkout. `app/order_flow.py`: the code-written order summary, "yes" handling and confirmations.
 - `app/agent/`: LangGraph agent (`graph.py`), guards, intents, modular prompts in `prompts/`.
 - `app/retrieval.py`, `app/ingestion/`: hybrid search (local multilingual embeddings + BM25); index lives in `index/` (gitignored).
 - `app/data/`: MongoDB access (read-only).
 - `widget/`: React 18 + TypeScript + Vite chat widget, built to `widget/dist/cheezious-chat.js`.
-- `ui.py`: Streamlit internal test UI. `chat.py`: terminal chat.
+- `chat.py`: terminal chat. Testing UI is the React widget's demo page (`make api`).
 - `tests/`, `eval/`: pytest suite and golden-set evaluation.
 
 ## Running locally
@@ -22,9 +23,8 @@ Always use `.venv` (Python 3.12); the system `python3` lacks the packages. Setti
 open -a Ollama   # LLM_PROVIDER=ollama needs the Ollama server on :11434
 make index       # rebuild search index from MongoDB (after menu changes, or if index/ is missing)
 make api         # API + built widget: http://localhost:8000/widget/demo.html
-make ui          # Streamlit: http://localhost:8501
 make widget      # rebuild widget/dist after editing widget/src
-make test        # 255 tests; Mongo-backed ones fail without a reachable MONGO_URI
+make test        # 396 tests (~20 s); Mongo-backed ones fail without a reachable MONGO_URI
 ```
 
 - The API mounts `widget/dist` only at startup: after the first `make widget`, restart `make api`

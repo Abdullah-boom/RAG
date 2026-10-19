@@ -193,6 +193,19 @@ def chosen_from_offered(said: str, offered: Tuple[dict, ...]) -> Optional[dict]:
     return hits[0] if len(hits) == 1 else None
 
 
+def named_fully(name: str, said: str, typos: bool = True) -> bool:
+    """The customer said every distinctive word of this name; type words are optional ("cheese lover" names
+    "Cheese Lover Pizza", but not "Chicken Lover"). typos=False: their exact words only (a price answer then says
+    which spelling it assumed)."""
+    words = set(_norm(said))
+    if typos:
+        words |= set(index().corrections(" ".join(words)).values())
+    # Only type words are optional: an ingredient ("chicken") tells "Chicken Lover" from "Cheese Lover".
+    distinctive = {w for w in _norm(name) if w not in KIND_WORDS | set(CATEGORY_WORDS) | ADD_WORDS | {"deal", "deals", "meal"}
+                   and len(w) > 2}
+    return bool(distinctive) and distinctive <= words
+
+
 def named_by_customer(item: dict, said: str) -> bool:
     """The customer typed a word only this item's name has ("fettuccine", "reggy"), allowing for typos."""
     words = set(_norm(said)) - NOT_A_CHOICE
@@ -220,15 +233,21 @@ def _options(said: str, item: Optional[dict], branch_id: str, offered: Tuple[dic
 
 def _as_options(items: List[dict]) -> List[dict]:
     """Available items as "which one?" options (shown as cards with Add buttons)."""
+    by_name = {}  # the menu repeats some items under new ids (two "Zalmi Meal"s): one card per name
+    for i in repo.merge_duplicates([i for i in items if i["available"]]):
+        by_name.setdefault(_key(i["name"]), i)
     return [{"item_id": i["item_id"], "name": i["name"], "type": i.get("type"), "category": i.get("category"),
              "price": i.get("price"), "price_from": i.get("price_from"), "sizes": i.get("sizes"),
-             "available": True} for i in repo.merge_duplicates([i for i in items if i["available"]])[:6]]
+             "available": True} for i in list(by_name.values())[:6]]
 
 
 def _which_one(said: str, options: List[dict]) -> dict:
     return {"error": "which_one", "customer_said": said[:120], "options": options,
             "note": "The customer did not say which one. Do not pick: list these options with type and price "
                     "and ask which one (and size, if it has sizes)."}
+
+
+DEAL_ASKED = re.compile(r"\b(deals?|combos?|meals?|offers?)\b|ڈیل", re.I)
 
 
 def resolve_for_chat(ctx, arg: CartItemArg) -> Tuple[Optional[dict], Optional[dict]]:
@@ -255,11 +274,20 @@ def resolve_for_chat(ctx, arg: CartItemArg) -> Tuple[Optional[dict], Optional[di
     if item and named_by_customer(item, said):
         return item, None
     options = _options(said, item, ctx.branch_id, offered)
+    named = [o for o in options if named_fully(o["name"], said)] or \
+        [o for o in options if named_by_customer(o, said)]
+    if len(named) == 1:  # "bazinga": only Bazinga Burger has it in its name (deals only mention it inside)
+        live = repo.get_items([named[0]["item_id"]], ctx.branch_id)
+        if live and live[0]["available"]:
+            return live[0], None
     if len(options) == 1 and (item is None or options[0]["item_id"] == item["item_id"]):
         # the only item of that kind here: nothing to choose between
         return item or (repo.get_items([options[0]["item_id"]], ctx.branch_id) or [None])[0], None
     if not options:
         return None, problem or {"error": "not_found", "requested": said[:80]}
+    if not DEAL_ASKED.search(said) and any(o.get("type") != "deal" for o in options):
+        # "pepsi": deals that merely include a drink aren't what they asked for; offer the items themselves
+        options = [o for o in options if o.get("type") != "deal"]
     return None, _which_one(said, options)
 
 

@@ -5,7 +5,11 @@ branch, so an operation for one branch can never read or change another branch's
 branch, starting a new chat or reopening the app keeps every cart as it was.
 
 Lines are {item_id, name, size, qty}; prices are never stored (app/cart.py re-prices on every read).
-Next to each cart: the payment method the customer picked for it (a code like "COD"; see app/payments.py).
+Next to each cart: the payment method the customer picked for it (a code like "COD"; see app/payments.py),
+the order type (DELIVERY / PICKUP, with the delivery spot for a delivery) and, between "here's your order,
+confirm?" and the customer's yes, the pending confirm token. Per owner (all branches): the orders the bot placed
+({order_id, order_no, branch_id, placed_at}), kept server side only so the bot can track them; never sent to the
+app.
 Redis when REDIS_URL is set (survives restarts, shared by workers, expires after CART_TTL_DAYS idle);
 otherwise process memory (dev only). Every change runs under a per-cart lock, so a chat turn and a cart
 button pressed at the same time can't overwrite each other's change.
@@ -46,10 +50,41 @@ def _pay_key(owner: str, branch_id: str) -> str:
     return f"pay:{branch_id}:{owner}"
 
 
-class MemoryCartStore:
+def _meta_key(kind: str, owner: str, branch_id: Optional[str] = None) -> str:
+    return f"{kind}:{branch_id}:{owner}" if branch_id else f"{kind}:{owner}"
+
+
+MAX_PLACED = 10  # orders remembered per owner for tracking, newest first
+
+
+class _Meta:
+    """Small JSON values next to the carts, on top of a store's _get_json / _set_json."""
+
+    def get_order(self, owner: str, branch_id: str) -> Optional[dict]:
+        """{"type": "DELIVERY" | "PICKUP", "lat"?, "lng"?} or None (not chosen yet)."""
+        return self._get_json(_meta_key("order", owner, branch_id))
+
+    def set_order(self, owner: str, branch_id: str, order: Optional[dict]) -> None:
+        self._set_json(_meta_key("order", owner, branch_id), order)
+
+    def get_confirm(self, owner: str, branch_id: str) -> Optional[str]:
+        return self._get_json(_meta_key("confirm", owner, branch_id))
+
+    def set_confirm(self, owner: str, branch_id: str, token: Optional[str]) -> None:
+        self._set_json(_meta_key("confirm", owner, branch_id), token)
+
+    def placed_orders(self, owner: str) -> List[dict]:
+        return self._get_json(_meta_key("placed", owner)) or []
+
+    def add_placed(self, owner: str, order: dict) -> None:
+        self._set_json(_meta_key("placed", owner), ([order] + self.placed_orders(owner))[:MAX_PLACED])
+
+
+class MemoryCartStore(_Meta):
     def __init__(self) -> None:
         self._carts: Dict[str, List[dict]] = {}
         self._payments: Dict[str, str] = {}
+        self._meta: Dict[str, str] = {}
         self._locks: Dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
 
@@ -70,6 +105,16 @@ class MemoryCartStore:
             self._payments[_pay_key(owner, branch_id)] = code
         else:
             self._payments.pop(_pay_key(owner, branch_id), None)
+
+    def _get_json(self, key: str):
+        raw = self._meta.get(key)
+        return json.loads(raw) if raw else None
+
+    def _set_json(self, key: str, value) -> None:
+        if value:
+            self._meta[key] = json.dumps(value)
+        else:
+            self._meta.pop(key, None)
 
     @contextmanager
     def lock(self, owner: str, branch_id: str) -> Iterator[None]:
@@ -94,7 +139,7 @@ def _redis_errors() -> Iterator[None]:
         raise CartUnavailable() from e
 
 
-class RedisCartStore:
+class RedisCartStore(_Meta):
     def __init__(self, url: str, ttl_days: int) -> None:
         import redis
         self._r = redis.Redis.from_url(url, socket_timeout=3, socket_connect_timeout=3)
@@ -123,6 +168,18 @@ class RedisCartStore:
                 self._r.set(_pay_key(owner, branch_id), code, ex=self._ttl)
             else:
                 self._r.delete(_pay_key(owner, branch_id))
+
+    def _get_json(self, key: str):
+        with _redis_errors():
+            raw = self._r.get(key)
+        return json.loads(raw) if raw else None
+
+    def _set_json(self, key: str, value) -> None:
+        with _redis_errors():
+            if value:
+                self._r.set(key, json.dumps(value), ex=self._ttl)
+            else:
+                self._r.delete(key)
 
     @contextmanager
     def lock(self, owner: str, branch_id: str) -> Iterator[None]:

@@ -17,6 +17,9 @@ from app.agent.guards import MIXED, ROMAN_URDU, ROMAN_URDU_LANG, URDU_SCRIPT
 from app.retrieval import _synonyms, index
 
 GREETING, THANKS, BYE, IDENTITY, ABUSE, OFF_TOPIC = "greeting", "thanks", "bye", "identity", "abuse", "off_topic"
+SMALL_TALK = "small_talk"  # "aur sunao", "kaise ho", "how's your day?": greet back, then ask what they'd like
+COMPLAIN = "complain"  # a bad experience / refund: sorry + where it gets handled; never promise a refund
+AFFIRM, DENY = "affirm", "deny"  # "haan ji" / "nahi" with nothing waiting for an answer
 
 
 def _norm(text: str) -> str:
@@ -157,6 +160,34 @@ REPLIES = {
                          "mein madad kar sakta hoon. Aaj kya khana pasand karenge?",
         URDU_SCRIPT: "{salam} چیزیئس میں خوش آمدید۔ میں مینو، ڈیلز، قیمتوں، کارٹ اور آپ کے آرڈر میں مدد کر سکتا ہوں۔ "
                      "آج کیا کھانا پسند کریں گے؟",
+    },
+    SMALL_TALK: {
+        "latin": "I'm doing great, thanks for asking! What would you like to order today? I can show you our deals, "
+                 "best sellers or something spicy.",
+        ROMAN_URDU_LANG: "Main bilkul theek hoon, shukriya! Aaj kya order karna chahenge? Main deals, best sellers ya "
+                         "kuch spicy dikha sakta hoon.",
+        URDU_SCRIPT: "میں بالکل ٹھیک ہوں، شکریہ! آج کیا آرڈر کرنا چاہیں گے؟ میں ڈیلز، بیسٹ سیلرز یا کچھ مصالحے دار "
+                     "دکھا سکتا ہوں۔",
+    },
+    COMPLAIN: {
+        "latin": "I'm really sorry about that. I can't handle complaints or refunds in this chat, but our team can: "
+                 "please report it from that order in the app, or call the Cheezious helpline. Can I help you with "
+                 "anything else?",
+        ROMAN_URDU_LANG: "Iske liye bohat maazrat. Main is chat mein complaint ya refund handle nahi kar sakta, lekin "
+                         "hamari team kar sakti hai: app mein us order se report karein, ya Cheezious helpline par "
+                         "call karein. Kisi aur cheez mein madad karun?",
+        URDU_SCRIPT: "اس کے لیے بہت معذرت۔ میں اس چیٹ میں شکایت یا ریفنڈ نہیں سنبھال سکتا، لیکن ہماری ٹیم کر سکتی ہے: "
+                     "ایپ میں اس آرڈر سے رپورٹ کریں، یا چیزیئس ہیلپ لائن پر کال کریں۔ کسی اور چیز میں مدد کروں؟",
+    },
+    AFFIRM: {
+        "latin": "Great! What would you like? Tell me the item's name, or its number in the list.",
+        ROMAN_URDU_LANG: "Zaroor! Kya chahiye? Item ka naam batayein, ya list mein uska number.",
+        URDU_SCRIPT: "ضرور! کیا چاہیے؟ آئٹم کا نام بتائیں، یا فہرست میں اس کا نمبر۔",
+    },
+    DENY: {
+        "latin": "No problem. Anything else I can help with, like deals or best sellers?",
+        ROMAN_URDU_LANG: "Koi baat nahi. Kisi aur cheez mein madad karun, jaise deals ya best sellers?",
+        URDU_SCRIPT: "کوئی بات نہیں۔ کسی اور چیز میں مدد کروں، جیسے ڈیلز یا بیسٹ سیلرز؟",
     },
     THANKS: {
         "latin": "You're welcome! Is there anything else I can help you with?",

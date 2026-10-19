@@ -7,6 +7,10 @@ types a card number anyway, before the model or the logs see it.
 
 Tax depends on how the customer pays (branches.codTaxRate for cash, onlineTaxRate for online), so each
 method carries its own estimate. Estimates only: delivery fee, discounts and vouchers are added at checkout.
+
+Which methods fit also depends on the order type (DELIVERY or PICKUP, the values orders.type uses): cash on
+delivery is not offered for a pickup, cash on pickup not for a delivery. Pass order_type to options() / find()
+/ checkout() to get only the methods that fit; None (type not chosen yet) means every method.
 """
 import re
 from typing import List, Optional
@@ -23,6 +27,9 @@ METHODS = {
     "XPAY_JAZZCASH": {"name": "JazzCash (online)", "kind": "online", "when": "any"},
     "PAYMENT_GATEWAY_HBL": {"name": "Card via HBL (online)", "kind": "online", "when": "any"},
 }
+DELIVERY, PICKUP = "DELIVERY", "PICKUP"
+ORDER_TYPES = (DELIVERY, PICKUP)
+ORDER_TYPE_NAMES = {DELIVERY: "Delivery", PICKUP: "Pickup"}
 CASH_TYPES = {"COD", "COP"}  # paymentType values taxed at the cash rate; ONLINE uses the online rate
 ESTIMATE_NOTE = "Estimate: delivery fee, discounts and vouchers are added in the app at checkout."
 SECURE_NOTE = "Online payments are made in the app's secure checkout. Never share card numbers or OTPs in chat."
@@ -38,14 +45,23 @@ def tax_estimate(subtotal: int, rate: Optional[float], exclusive: bool) -> dict:
     return {"tax_rate": rate, "tax": round(subtotal * rate / (100 + rate)), "total": subtotal}
 
 
-def options(config: Optional[dict], subtotal: int = 0) -> List[dict]:
-    """Methods this branch accepts right now, cheapest total first (online often has a lower tax rate)."""
+def fits(code: str, order_type: Optional[str]) -> bool:
+    """Can this method pay for this type of order? Unknown type: yes (nothing to rule it out by yet)."""
+    when = METHODS.get(code, {}).get("when", "any")
+    return not order_type or when == "any" or when == order_type.lower()
+
+
+def options(config: Optional[dict], subtotal: int = 0, order_type: Optional[str] = None) -> List[dict]:
+    """Methods this branch accepts right now for this order type, cheapest total first (online often has a
+    lower tax rate)."""
     if not config:
         return []
     out = []
     for m in config["methods"]:
         meta = METHODS.get(m["label"])
         if not m["available"] or not meta:  # switched off, or a new method we can't describe yet
+            continue
+        if not fits(m["label"], order_type):
             continue
         cash = m["payment_type"] in CASH_TYPES
         rate = config["cash_tax_rate"] if cash else config["online_tax_rate"]
@@ -63,13 +79,13 @@ def _words(text: str) -> set:
     return set(re.findall(r"[a-z]+", text.lower()))
 
 
-def find(config: Optional[dict], code_or_name: str) -> Optional[dict]:
+def find(config: Optional[dict], code_or_name: str, order_type: Optional[str] = None) -> Optional[dict]:
     """An available method by code ("COD") or by how a customer says it ("cash on delivery", "online card").
     Every method word the customer used must be in the method's name, and only one method may fit: "card"
     alone is ambiguous (machine at the door or online?), and "jazzcash online" never falls back to another
     online method when JazzCash is switched off."""
     wanted = (code_or_name or "").strip().lower()
-    opts = options(config)
+    opts = options(config, order_type=order_type)
     for o in opts:
         if wanted in (o["code"].lower(), o["name"].lower()):
             return o
@@ -80,15 +96,15 @@ def find(config: Optional[dict], code_or_name: str) -> Optional[dict]:
     return hits[0] if len(hits) == 1 else None
 
 
-def candidates(config: Optional[dict], said: str) -> List[dict]:
+def candidates(config: Optional[dict], said: str, order_type: Optional[str] = None) -> List[dict]:
     """Available methods that fit the customer's words ("card" -> card machine at the door, online card)."""
     key = _words(said or "") & METHOD_WORDS
-    return [o for o in options(config) if key and key <= _words(o["name"])]
+    return [o for o in options(config, order_type=order_type) if key and key <= _words(o["name"])]
 
 
-def checkout(config: Optional[dict], subtotal: int, code: Optional[str]) -> dict:
-    """What the cart shows: the chosen method (if still available) with its estimate."""
-    chosen = next((o for o in options(config, subtotal) if o["code"] == code), None) if code else None
+def checkout(config: Optional[dict], subtotal: int, code: Optional[str], order_type: Optional[str] = None) -> dict:
+    """What the cart shows: the chosen method (if still available for this order type) with its estimate."""
+    chosen = next((o for o in options(config, subtotal, order_type) if o["code"] == code), None) if code else None
     return {"payment_method": chosen, "note": ESTIMATE_NOTE, "secure_note": SECURE_NOTE}
 
 

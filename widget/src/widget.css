@@ -360,6 +360,57 @@
   background: var(--cz-bg);
 }
 
+/* ---------- delivery or pickup ---------- */
+.cz-choose { flex: 1; display: flex; flex-direction: column; gap: 12px; padding: 16px; overflow-y: auto; }
+.cz-choose-ask { align-self: flex-start; }
+.cz-choose-options { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.cz-choose-btn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 12px;
+  border: 1.5px solid var(--cz-line);
+  border-radius: 12px;
+  background: var(--cz-bg);
+  color: var(--cz-ink);
+  text-align: left;
+}
+.cz-choose-btn strong { font-size: 15px; }
+.cz-choose-btn span { font-size: 12.5px; color: var(--cz-muted); }
+.cz-choose-btn:hover, .cz-choose-btn.is-current { border-color: var(--cz-accent); background: var(--cz-soft); }
+.cz-choose .cz-picker-cancel { margin: 0; }
+
+/* Confirm / Cancel under the order summary */
+.cz-confirm-row { display: flex; gap: 8px; padding: 2px 0 6px 2px; }
+.cz-confirm-row .cz-confirm-btn {
+  padding: 9px 16px;
+  border: none;
+  border-radius: 10px;
+  background: var(--cz-accent);
+  color: #1f1f1f;
+  font-weight: 700;
+}
+.cz-cancel-btn {
+  padding: 9px 14px;
+  border: 1px solid var(--cz-line);
+  border-radius: 10px;
+  background: var(--cz-bg);
+  color: var(--cz-ink);
+}
+.cz-confirm-row button:disabled { opacity: 0.6; cursor: default; }
+
+/* the order's choices, always in view like the cart */
+.cz-orderbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--cz-line);
+  background: var(--cz-soft);
+  font-size: 12.5px;
+}
+.cz-orderbar > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ---------- phones: full screen ---------- */
 @media (max-width: 520px) {
   .cz { bottom: 16px; }

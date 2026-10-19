@@ -97,7 +97,7 @@ def client(monkeypatch):
     import app.cart as cart_mod
     seen = []
 
-    def fake_chat(message, *, thread_id, branch_id, user_id=None, cart=None, payment_method=None):
+    def fake_chat(message, *, thread_id, branch_id, user_id=None, cart=None, payment_method=None, **_):
         seen.append(payment_method)
         out = {"answer": "ok", "items": [], "suggestions": [], "cart": None, "handoff": False, "as_of": "t",
                "cart_lines": list(cart or [])}

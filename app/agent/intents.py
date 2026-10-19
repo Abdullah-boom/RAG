@@ -8,7 +8,7 @@ where the item is simply what's left after the question words. Anything else tha
 turned into arguments (add to cart, open-ended searches) stays with the model.
 """
 import re
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from app import cart
 from app.retrieval import index
@@ -24,7 +24,7 @@ CART_VIEW = re.compile(
     r"|cart\s+(me|mein|main|mai|men|dikhao|dikha|dikhado|show|kya|check)"
     r"|(show|view|see|check|open)\s+(the\s+|my\s+)?cart"
     r"|in\s+(my|the)\s+cart"
-    r"|total\s+(kitna|kya|how\s+much)"
+    r"|total\s+(kitna|kya|how\s+much)|(kitne|kitna)\s+ka\s+hua|kitna\s+hua|(sab|total)\s+kitne?\s+ka"
     r"|how\s+much\s+is\s+(my\s+|the\s+)?total)\b"
     r"|کارٹ",
     re.I)
@@ -42,14 +42,15 @@ BEST = re.compile(
     re.I)
 
 # Adding one thing to the cart: the cart code decides what (named / pointed at / "which one?"), not the model.
-ADD = re.compile(_W + r"(add|daal|daalo|dalo|dal\s+do|daal\s+do|dal\s+den|daal\s+dein|put|include)\b"
+ADD = re.compile(_W + r"(add|daal|daalo|dalo|dal\s+do|daal\s+do|dal\s+den|daal\s+dein|put|include"
+                 r"|laga\s+do|lga\s+do|lagao|laga\s+dein|laga\s+den)\b|ایڈ|ڈال\s*د|شامل\s+کر"
                  r"|cart\s+(mein|me|main)\s+(daal|dal|add)", re.I)
 NOT_ADD = re.compile(_W + r"(remove|hata|hatao|nikal|nikalo|clear|khali|empty|delete|cancel)\b", re.I)
 SEVERAL = re.compile(r"\b(aur|and|plus|&)\b|,", re.I)  # "2 bazinga aur 1 pasta": the model splits these
 NUMBER_WORDS = {"one": 1, "ek": 1, "aik": 1, "two": 2, "three": 3, "teen": 3, "four": 4, "char": 4, "chaar": 4,
                 "five": 5, "panch": 5, "paanch": 5, "six": 6, "che": 6, "chay": 6}
 ADD_FILLER = re.compile(_W + r"(add|daal|daalo|dalo|dal|daal|do|den|dein|put|include|to|in|into|my|the|a|an|cart"
-                        r"|mein|me|main|please|plz|pls|bhi|bhai|yaar|karo|kar|kardo|kr|krdo)\b", re.I)
+                        r"|mein|me|main|please|plz|pls|bhi|bhai|yaar|karo|kar|kardo|kr|krdo|laga|lga|lagao)\b", re.I)
 # "pehli wali", "the second one", "option 2", "large" (after "which size?"): pointing at what was just shown.
 POINT = re.compile(_W + r"(first|second|third|fourth|fifth|last|1st|2nd|3rd|4th|5th|pehla|pehli|pehle|dusra|dusri"
                    r"|doosra|doosri|teesra|teesri|aakhri|akhri|isko|usko|yehi|wohi|option\s*\d|number\s*\d)\b", re.I)
@@ -104,10 +105,41 @@ CHOICE = re.compile(
 PAYMENT_PHRASE = re.compile(r"\b(cash|card|pay\w*)\s+on\s+(delivery|pickup)\b", re.I)  # not a delivery question
 
 
+# Switching between delivery and pickup ("pickup kar do", "make it delivery", "I'll collect it myself"); a
+# question about the service ("do you deliver to G-11?") has no switching word and stays a branch question.
+TYPE_WORD = re.compile(r"\b(?P<pickup>pick[\s-]*up|take[\s-]*away|collect|self[\s-]*pick\w*|khud\s+(le|aa|utha)\w*)\b"
+                       r"|\b(?P<delivery>delivery|deliver|home\s+delivery|ghar\s+(pe|par|mangwa\w*))\b", re.I)
+SWITCH = re.compile(_W + r"(switch|change|make\s+it|instead|kar\s*do|kardo|karna|karein|kar\s+dein|chahiye|i'?ll"
+                    r"|i\s+will|i\s+want|i'd\s+like|want|rather|rakh\w*|lunga|lungi|le\s+lunga|aa\s+ke|aakar"
+                    r"|myself|khud)\b", re.I)
+INSTEAD_OF = re.compile(r"\binstead\s+of\s+(\w[\w\s-]*)", re.I)
+
+
+def order_type_call(message: str) -> Optional[Tuple[str, dict]]:
+    """("set_order_type", {"order_type": ...}) when the customer switches delivery / pickup, else None. With both
+    words, the target is the one not after "instead of", else the last one ("delivery se pickup kar do")."""
+    text = PAYMENT_PHRASE.sub(" ", message)  # "cash on delivery" is a payment, not the order type
+    hits = [(m.start(), "pickup" if m.group("pickup") else "delivery") for m in TYPE_WORD.finditer(text)]
+    if not hits or not SWITCH.search(text):
+        return None
+    instead = INSTEAD_OF.search(text)
+    if instead:
+        hits = [h for h in hits if h[0] < instead.start()] or hits
+    return "set_order_type", {"order_type": hits[-1][1]}
+
+
+TRACK = re.compile(_W + r"(where\s+is\s+my\s+order|where'?s\s+my\s+order|(my\s+)?order\s+status|status\s+of\s+(my\s+)?order"
+                   r"|track(ing)?\s+(my\s+)?order|(mera|meray|mere)\s+order\s+(kahan|kidhar|kab|ka\s+status)"
+                   r"|order\s+(kahan|kidhar)\s+(hai|pohncha|pahuncha)|order\s+kab\s+(aye?ga|ayega|pohnchega)"
+                   r"|kab\s+tak\s+(aa|aaye?|aye?|pohnch|pahunch)\w*|how\s+long\s+(will|till|until)\b.*\b(order|food|it)"
+                   r"|میرا\s+آرڈر\s+کہاں|کب\s+تک\s+(آ|پہنچ))", re.I)
+ORDER_NO = re.compile(r"\b\d{6}-\d{3,6}\b")
+
+
 ORDER_NOW = re.compile(
     _W + r"(place\s+(the\s+|my\s+)?order|confirm(\s+(the|my))?\s+order|order\s+(confirm|place|kar\s*do|kardo|karo"
     r"|kar\s+dein|de\s+do|dedo|laga\s+do)|checkout|check\s+out|order\s+kar(na|ni)\s+hai|i'?m\s+ready\s+to\s+order)\b"
-    r"|آرڈر\s+کر", re.I)
+    r"|آرڈر\s+(کر\s*(دو|دیں|دیجیے|دیجئے)|کنفرم)", re.I)  # a command; "کیا آرڈر کریں؟" asks what to order
 
 
 PRICE = re.compile(_W + r"(kitni|kitne|kitna|kitnay|kitny|price|prices|priced|cost|costs|rate|rates|how\s+much"
@@ -167,11 +199,23 @@ def price_query(message: str) -> str:
     return " ".join(menu_words)
 
 
+def certain(message: str) -> bool:
+    """The word lists alone are sure what this is (place / confirm the order, track it, switch delivery /
+    pickup): the planner call can be skipped, and prefetch_tools runs the same lookup."""
+    return bool(ORDER_NOW.search(message) or TRACK.search(message) or order_type_call(message))
+
+
 def prefetch_tools(message: str) -> List[Tuple[str, dict]]:
     """(tool, args) calls this message clearly needs, most specific first, at most MAX_PREFETCH."""
     calls: List[Tuple[str, dict]] = []
-    if ORDER_NOW.search(message):  # "order confirm karo": check readiness; only the Confirm tap places it
+    if ORDER_NOW.search(message):  # "order confirm karo": check readiness; only the customer's "yes" places it
         return [("review_order", {})]
+    switch = order_type_call(message)
+    if switch:
+        return [switch]
+    if TRACK.search(message):  # a lookup only: works (and is answered from code) even when the model is down
+        number = ORDER_NO.search(message)
+        return [("get_order_status", {"order_no": number.group(0)} if number else {})]
     adding = ADD.search(message) or SIZE_ONLY.match(message) or (POINT.search(message) and not QUESTION.search(message))
     if adding and not NOT_ADD.search(message) and not SEVERAL.search(message) and not PAYMENT.search(message):
         return [add_call(message)]
@@ -205,7 +249,7 @@ ALL_TOPICS = ("menu", "cart", "payment", "checkout", "branch", "orders", "faq")
 TOOL_TOPIC = {"search_menu": "menu", "get_item_details": "menu", "get_deals": "menu", "get_best_sellers": "menu",
               "calculate_total": "menu", "add_to_cart": "cart", "remove_from_cart": "cart", "view_cart": "cart",
               "clear_cart": "cart", "get_payment_methods": "payment", "set_payment_method": "payment",
-              "review_order": "checkout", "check_branch_status": "branch", "get_order_status": "orders",
+              "set_quantity": "cart", "review_order": "checkout", "set_order_type": "checkout", "check_branch_status": "branch", "get_order_status": "orders",
               "get_order_history": "orders", "search_faq": "faq"}
 TOPIC_TOOLS = {t: [n for n, tt in TOOL_TOPIC.items() if tt == t] for t in ALL_TOPICS}
 ORDERS = re.compile(_W + r"(my\s+order|mera\s+order|meray\s+order|order\s+(status|kahan|kidhar|kab|history)"
@@ -222,7 +266,7 @@ def topics(message: str, calls: List[Tuple[str, dict]], offered: bool) -> List[s
         found.add("cart")
     if PAYMENT.search(message):
         found |= {"payment", "cart"}
-    if ORDER_NOW.search(message):
+    if ORDER_NOW.search(message) or order_type_call(message):
         found |= {"checkout", "cart", "payment"}
     if BRANCH.search(PAYMENT_PHRASE.sub(" ", message)):
         found.add("branch")

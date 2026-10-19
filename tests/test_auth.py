@@ -22,7 +22,7 @@ def token(claims=None, key=SECRET, alg="HS256", **extra):
 def client(monkeypatch):
     calls = []
 
-    def fake_chat(message, *, thread_id, branch_id, user_id=None, cart=None, payment_method=None):
+    def fake_chat(message, *, thread_id, branch_id, user_id=None, cart=None, payment_method=None, **_):
         calls.append({"thread_id": thread_id, "user_id": user_id})
         return {"answer": "ok", "items": [], "suggestions": [], "cart": None, "handoff": False, "as_of": "t"}
 

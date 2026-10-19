@@ -104,7 +104,7 @@ def client(monkeypatch):
     import app.cart as cart_mod
     calls = []
 
-    def fake_chat(message, *, thread_id, branch_id, user_id=None, cart=None, payment_method=None):
+    def fake_chat(message, *, thread_id, branch_id, user_id=None, cart=None, payment_method=None, **_):
         """Stands in for the agent: 'add burger' adds p1 to whatever cart it was given."""
         calls.append({"branch_id": branch_id, "cart_in": list(cart or []), "thread_id": thread_id})
         lines = list(cart or [])
@@ -146,7 +146,7 @@ def cart_names(client, branch_id, headers=None):
 def test_branch_list_says_which_are_open(client):
     rows = {b["branch_id"]: b for b in client.get("/api/branches").json()["branches"]}
     assert rows[A["branch_id"]]["open_now"] and not rows[C["branch_id"]]["open_now"]
-    assert set(rows[A["branch_id"]]) == {"branch_id", "name", "city", "open_now", "accepting_orders"}
+    assert set(rows[A["branch_id"]]) == {"branch_id", "name", "city", "open_now", "accepting_orders", "pickup"}
 
 
 def test_locate_matches_branch(client, monkeypatch):
@@ -233,7 +233,8 @@ def test_guest_id_is_minted_and_carts_are_per_owner(client):
     minted = r["guest_id"]
     assert len(minted) == 32 and cart_names(client, A["branch_id"], headers=guest(minted)) == [("Bazinga Burger", None, 1)]
     assert cart_names(client, A["branch_id"], headers=guest(GUEST_2)) == []  # another guest sees nothing
-    assert client.get(f"/api/cart?branch_id={A['branch_id']}").json() == {"guest_id": None, "cart": None}
+    assert client.get(f"/api/cart?branch_id={A['branch_id']}").json() == {
+        "guest_id": None, "cart": None, "order": {"type": None, "type_name": None, "payment_method": None}}
 
 
 def test_logged_in_cart_belongs_to_the_account(client, monkeypatch):

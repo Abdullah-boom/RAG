@@ -42,6 +42,11 @@ EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 DIGIT_GROUP_SPACE = re.compile(r"(?<=\d)[\s\u00a0\u202f\u2009](?=\d{3}\b)")
 
 
+# "30-45 minute", "lagbhag 45 minute mein", "2 ghante": a time the model states. It invented delivery times twice.
+TIME_CLAIM = re.compile(r"(\d+)(?:\s*(?:-|–|to|se)\s*(\d+))?\s*(?:minutes?|mins?|minat|mint|ghant[ae]y?|hours?|hrs?)\b",
+                        re.I)
+
+
 def amounts_in(text: str) -> List[float]:
     out = []
     text = DIGIT_GROUP_SPACE.sub("", text or "")  # "Rs 1 350" -> "Rs 1350"
@@ -178,6 +183,10 @@ def check_answer(answer: str, tool_results: Iterable[dict], tools_called: Iterab
             bad = [a for a in amounts if a not in allowed]
             if bad:
                 problems.append(f"amount(s) {sorted(set(bad))} not found in tool results")
+    times = {float(n) for m in TIME_CLAIM.finditer(text) for n in m.groups() if n}
+    if times and not times <= numbers_in(results):
+        problems.append(f"states a time {sorted(times)} that no tool returned: never estimate delivery or "
+                        "preparation times; say the app shows the time once the branch accepts the order")
     if STATUS_WORDS.search(answer or "") and not (called & (ORDER_TOOLS | PAYMENT_TOOLS)) \
             and "order" in (answer or "").lower():
         problems.append("states an order status without calling an order tool")
@@ -206,7 +215,7 @@ MAX_MESSAGE_CHARS = 1000
 # Roman Urdu words (several spellings) that are not also English words, so "main", "do", "or" are left out.
 # This list only strengthens the hint; when it finds nothing the model is told to mirror the customer.
 ROMAN_URDU = re.compile(
-    r"\b(hai|hain|hy|ha|hen|kya|kia|kyun|kyon|mera|meri|mere|mujhe|mujhay|muje|hum|humein|aap|ap|apka|"
+    r"\b(hai|hain|hy|ha|hen|kya|kia|kyun|kyon|mera|meri|mere|mujhe|mujhay|muje|hum|humein|aap|ap|apka|laga|lagao|"
     r"tum|kitna|kitne|kitni|kitnay|kitny|chahiye|chahye|chaiye|aur|wala|wali|walay|wale|kab|kahan|kidhar|"
     r"kaise|kese|kesa|kuch|kch|koi|nahi|nahin|nai|hoga|hogi|karo|kar|kr|krna|krdo|bata|batao|btao|"
     r"bta|dena|dedo|bhi|abhi|jaldi|bhai|yaar|yar|acha|achha|theek|thik|zyada|zayada|zayda|ziada|ziyada|"

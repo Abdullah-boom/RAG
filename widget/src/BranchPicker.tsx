@@ -3,16 +3,16 @@ import type { Api, Branch } from "./api";
 
 type Props = {
   api: Api;
-  current: Branch | null;
-  notice: string | null; // why the picker is showing (location off, no branch delivers here, ...)
-  nearby: string[]; // branches whose delivery area contains the customer, listed first
+  current: Branch | null; // the current pickup branch, if any
+  notice: string | null; // why the picker is showing (e.g. this branch has no pickup)
   lastUsed: string | null;
   switching: boolean;
   onPick: (b: Branch) => void;
   onCancel?: () => void;
 };
 
-export default function BranchPicker({ api, current, notice, nearby, lastUsed, switching, onPick, onCancel }: Props) {
+/** Pickup branches: only the ones open right now that offer pickup. */
+export default function BranchPicker({ api, current, notice, lastUsed, switching, onPick, onCancel }: Props) {
   const [branches, setBranches] = useState<Branch[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [query, setQuery] = useState("");
@@ -27,28 +27,25 @@ export default function BranchPicker({ api, current, notice, nearby, lastUsed, s
   const groups = useMemo(() => {
     const q = query.trim().toLowerCase();
     const map = new Map<string, Branch[]>();
-    const near = (branches ?? []).filter((b) => nearby.includes(b.branch_id));
-    if (near.length && !q) map.set("Delivers to you", near);
     for (const b of branches ?? []) {
+      if (!b.open_now || !b.pickup) continue;
       if (q && !`${b.name} ${b.city ?? ""}`.toLowerCase().includes(q)) continue;
-      if (!q && nearby.includes(b.branch_id)) continue;
       const city = b.city || "Other";
       map.set(city, [...(map.get(city) ?? []), b]);
     }
-    // open branches first inside each group
-    return [...map.entries()].map(([g, list]) => [g, [...list].sort((a, b) => Number(b.open_now) - Number(a.open_now))] as const);
-  }, [branches, query, nearby]);
+    return [...map.entries()];
+  }, [branches, query]);
 
   return (
     <div className="cz-picker">
       <div className="cz-picker-head">
-        <div className="cz-picker-title">Pick your branch</div>
+        <div className="cz-picker-title">Pick a branch for pickup</div>
         {notice ? (
           <div className="cz-notice" role="status">
             {notice}
           </div>
         ) : (
-          <div className="cz-muted">Prices, deals and timings depend on the branch.</div>
+          <div className="cz-muted">Branches open now that offer pickup. Prices and deals depend on the branch.</div>
         )}
         <input
           className="cz-search"
@@ -70,7 +67,11 @@ export default function BranchPicker({ api, current, notice, nearby, lastUsed, s
           </div>
         )}
         {!failed && !branches && <div className="cz-empty">Loading branches…</div>}
-        {branches && groups.length === 0 && <div className="cz-empty">No branch matches “{query}”.</div>}
+        {branches && groups.length === 0 && (
+          <div className="cz-empty">
+            {query ? `No open pickup branch matches “${query}”.` : "No branch is open for pickup right now."}
+          </div>
+        )}
         {groups.map(([group, list]) => (
           <div key={group} className="cz-city">
             <div className="cz-city-name">{group}</div>
@@ -79,15 +80,13 @@ export default function BranchPicker({ api, current, notice, nearby, lastUsed, s
                 key={b.branch_id}
                 className={`cz-branch-option ${current?.branch_id === b.branch_id ? "is-current" : ""}`}
                 onClick={() => onPick(b)}
-                disabled={!b.open_now || switching}
-                title={b.open_now ? undefined : "Closed now"}
+                disabled={switching}
               >
                 {b.name}
                 {current?.branch_id === b.branch_id && <span className="cz-muted"> · current</span>}
                 {current?.branch_id !== b.branch_id && lastUsed === b.branch_id && (
                   <span className="cz-muted"> · last used</span>
                 )}
-                {!b.open_now && <span className="cz-muted"> · closed now</span>}
               </button>
             ))}
           </div>
@@ -95,7 +94,7 @@ export default function BranchPicker({ api, current, notice, nearby, lastUsed, s
       </div>
       {onCancel && (
         <button className="cz-picker-cancel" onClick={onCancel}>
-          Back to chat
+          Back
         </button>
       )}
     </div>
