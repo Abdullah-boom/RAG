@@ -61,7 +61,10 @@ def _sound(word: str) -> str:
 
 def expand_query(query: str) -> str:
     q = query.lower()
-    extra = [w for key, words in _synonyms().items() if re.search(rf"\b{re.escape(key)}\b", q) for w in words]
+    keys = [key for key in _synonyms() if re.search(rf"\b{re.escape(key)}\b", q)]
+    # The longer key wins: "sweet corn" is corn, not "sweet" (dessert).
+    keys = [k for k in keys if not any(k != o and re.search(rf"\b{re.escape(k)}\b", o) for o in keys)]
+    extra = [w for key in keys for w in _synonyms()[key]]
     return " ".join([query] + extra)
 
 

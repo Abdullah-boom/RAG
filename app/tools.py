@@ -377,6 +377,27 @@ def tool_schemas(names: Optional[List[str]] = None) -> List[dict]:
 SECURITY_ARG = re.compile(r"(user|customer|branch)_?id", re.I)
 
 
+NULLISH = {"", "none", "null", "nil", "undefined"}
+
+
+def _lenient(model: Type[BaseModel], payload: dict) -> dict:
+    """Small models (Llama 3.1 8B) fill every optional argument: "None" for not given, a limit above the cap.
+    Read those as the default / the cap instead of failing the call. Unknown keys still fail (extra="forbid")."""
+    out = {}
+    for key, value in payload.items():
+        if value is None or (isinstance(value, str) and value.strip().lower() in NULLISH):
+            continue
+        field = model.model_fields.get(key)
+        for le in [getattr(m, "le", None) for m in (field.metadata if field else [])]:
+            try:
+                if le is not None and float(value) > le:
+                    value = le
+            except (TypeError, ValueError):
+                pass
+        out[key] = value
+    return out
+
+
 def run_tool(ctx: RequestContext, name: str, raw_args: str) -> dict:
     """Validate and execute one tool call (no cart). Never raises; errors come back as {'error': ...}."""
     return run_tool_with_cart(ctx, name, raw_args, [])[0]
@@ -396,7 +417,7 @@ def run_tool_with_cart(ctx: RequestContext, name: str, raw_args: str, cart_lines
     # Identity can't be passed in: drop any security-relevant key the model invents.
     payload = {k: v for k, v in payload.items() if not SECURITY_ARG.fullmatch(k)}
     try:
-        args = tool.args.model_validate(payload)
+        args = tool.args.model_validate(_lenient(tool.args, payload))
     except ValidationError as e:
         return {"error": "invalid_arguments", "details": e.errors(include_url=False, include_input=False)[:3]}, cart_lines
     try:

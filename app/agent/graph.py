@@ -1,10 +1,14 @@
 """LangGraph agent (spec 10):
 
-  START -> pre_checks -> prefetch -> agent <-> tools
-                           |
-                           +-> post_checks --(guard failed, 1 retry)--> agent
-                                    |
-                                    +-> format_response -> END
+  START -> pre_checks -> understand -> prefetch -> agent <-> tools
+                                          |
+                                          +-> post_checks --(guard failed, 1 retry)--> agent
+                                                   |
+                                                   +-> format_response -> END
+
+Layers: pre_checks = input hygiene + fixed replies the word lists are sure of (hi, thanks, abuse);
+understand = one JSON-schema model call that reads the message into a Plan (app/agent/understand.py);
+prefetch = the Plan's workflow: code runs the certain tools, or the agent gets only that intent's tools.
 
 Identity: user_id / branch_id are read from config["configurable"] (set by the server / UI), never from
 the model. Memory: RedisSaver (or InMemorySaver in dev) keyed by thread_id; each turn's tool traffic is removed at the end so
@@ -32,9 +36,11 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from pydantic import ValidationError
 from pymongo.errors import PyMongoError
 
 from app import config as settings
+from app.agent import behaviour, understand
 from app.agent.intents import ALL_TOPICS, QUESTION, add_call, prefetch_tools, tools_for, topics
 from app.cart import chosen_from_offered, pointed_item
 from app.agent.guards import (LANGUAGE_HINTS, MAX_MESSAGE_CHARS, NOT_ROMAN_URDU, REPLY_NOTES, check_answer,
@@ -44,7 +50,7 @@ from app.data.db import with_retry
 from app.retrieval import index
 from app.cart import price_cart
 from app.payments import find_card_number, redact_card_numbers
-from app.tools import (DB_UNAVAILABLE, RequestContext, SearchMenuArgs, run_tool_with_cart, search_menu,
+from app.tools import (DB_UNAVAILABLE, RequestContext, SearchMenuArgs, _lenient, run_tool_with_cart, search_menu,
                        tool_schemas, utc_now_iso)
 
 TIME_BUDGET_S = settings.LLM_TIME_BUDGET_S
@@ -73,6 +79,11 @@ FALLBACKS = {
     "roman_urdu": "Maaf kijiye, iska pakka jawab nahi bana saka. Thora alag tareeqe se poochein, ya app mein menu "
                   "dekh lein.",
     "urdu_script": "معذرت، اس کا پکا جواب نہیں بن سکا۔ ذرا مختلف طریقے سے پوچھیں، یا ایپ میں مینو دیکھ لیں۔",
+}
+NOT_ON_MENU = {
+    "latin": "Sorry, we don't have that on the menu at this branch. Would you like me to suggest something else?",
+    "roman_urdu": "Maaf kijiye, yeh is branch ke menu mein nahi hai. Kuch aur dikhaun?",
+    "urdu_script": "معذرت، یہ اس برانچ کے مینو میں نہیں ہے۔ کچھ اور دکھاؤں؟",
 }
 FOUND_FALLBACKS = {
     "latin": "I couldn't put a full answer together just now, but here's what I found on our live menu:",
@@ -117,6 +128,8 @@ class State(TypedDict, total=False):
     db_error: bool  # a Mongo read failed this turn: answer with one clear error, nothing partial
     cart_before: List[dict]  # restored if the turn fails
     response: Dict[str, Any]
+    plan: Optional[dict]  # understand's reading of this message; None = word-list path
+    nothing_fits: Optional[dict]  # {"say": "wish"|"item", "what": "sour"|"sushi"}: the answer opens by saying so
 
 
 def _ctx(config: RunnableConfig) -> RequestContext:
@@ -152,12 +165,15 @@ def _history(state: State) -> List[AnyMessage]:
 
 # ---------- LLM ----------
 
+OLLAMA_NUM_CTX = 8192
+
+
 @lru_cache(maxsize=1)
 def _ollama() -> ChatOllama:
     # num_ctx: Ollama's 4k default silently truncates the system prompt + tool schemas (~4.5k tokens).
     # num_predict caps answer length; keep_alive keeps the model loaded between customers.
     return ChatOllama(model=settings.OLLAMA_MODEL, base_url=settings.OLLAMA_BASE_URL,
-                      temperature=settings.TEMPERATURE, num_ctx=8192, num_predict=1024, keep_alive="30m",
+                      temperature=settings.TEMPERATURE, num_ctx=OLLAMA_NUM_CTX, num_predict=1024, keep_alive="30m",
                       client_kwargs=_ollama_client_kwargs())
 
 
@@ -185,6 +201,29 @@ def _retry_after(e: RateLimitError) -> float:
         return 60.0
 
 
+TEXT_TOOL_CALL = re.compile(r"^\s*(?:```(?:json)?\s*)?(\{.*\})\s*(?:```)?\s*$", re.S)
+
+
+def _text_tool_call(content: Any, names: set) -> Optional[dict]:
+    """Llama 3.1 via Ollama sometimes writes the tool call as its reply instead of making it:
+    {"name": "search_menu", "parameters": {...}}, often with Python False/None. Read it as the call it meant."""
+    m = TEXT_TOOL_CALL.match(content) if isinstance(content, str) and names else None
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        try:
+            data = json.loads(re.sub(r"\bFalse\b", "false", re.sub(r"\bTrue\b", "true",
+                                                                       re.sub(r"\bNone\b", "null", m.group(1)))))
+        except json.JSONDecodeError:
+            return None
+    args = data.get("parameters", data.get("arguments")) if isinstance(data, dict) else None
+    if not isinstance(args, dict) or data.get("name") not in names:
+        return None
+    return {"name": data["name"], "args": args}
+
+
 def _invoke_llm(messages: List[AnyMessage], allow_tools) -> AIMessage:
     """allow_tools: False (no tools), True (all) or a list of tool names (only those). Ollama: the local model.
     Groq: main model, then fallbacks when rate limited (each Groq model has its own free-tier quota); if all are
@@ -192,7 +231,11 @@ def _invoke_llm(messages: List[AnyMessage], allow_tools) -> AIMessage:
     schemas = (tool_schemas(None if allow_tools is True else list(allow_tools))) if allow_tools else None
     if settings.LLM_PROVIDER == "ollama":
         llm = _ollama().bind_tools(schemas) if schemas else _ollama()
-        return llm.invoke(messages)
+        msg = llm.invoke(messages)
+        call = _text_tool_call(msg.content, {s["function"]["name"] for s in schemas or []})
+        if call and not msg.tool_calls:
+            return AIMessage(content="", tool_calls=[{**call, "id": "text_call_0", "type": "tool_call"}])
+        return msg
 
     def attempt():
         last = None
@@ -286,7 +329,7 @@ def pre_checks(state: State) -> dict:
     cleaned = pre_check(human.content if isinstance(human.content, str) else "")
     base = {"turn_id": human.id, "started_at": time.time(), "tool_results": [], "tools_called": [],
             "steps": [], "retried": False, "answer": None, "fallback": False, "prefetched": False, "topics": [],
-            "offline": False, "db_error": False,
+            "offline": False, "db_error": False, "plan": None, "nothing_fits": None,
             "cart_before": list(state.get("cart") or [])}
     if cleaned is None:
         return {**base, "answer": f"Please send a message under {MAX_MESSAGE_CHARS} characters."}
@@ -295,14 +338,72 @@ def pre_checks(state: State) -> dict:
         language = detect_language(cleaned)
         return {**base, "language": language, "answer": CARD_WARNINGS.get(language, CARD_WARNINGS["latin"]),
                 "messages": [HumanMessage(content=redact_card_numbers(cleaned), id=human.id)]}
-    return {**base, "language": detect_language(cleaned),
+    language = detect_language(cleaned)
+    kind = behaviour.fast_kind(cleaned)
+    if kind:  # greeting / thanks / insult / who-are-you: a fixed reply, no tools, nothing for the model to invent
+        return {**base, "language": language, "answer": behaviour.reply(kind, language, cleaned),
+                "steps": [{"behaviour": kind}], "messages": [HumanMessage(content=cleaned, id=human.id)]}
+    return {**base, "language": language,
             "messages": [HumanMessage(content=cleaned, id=human.id)]}  # same id -> replaced in place
 
 
+def _ask_router(prompt: str) -> str:
+    """One short call with no tools and no history: the behaviour layer's FOOD / OTHER question."""
+    return _invoke_llm([HumanMessage(prompt)], allow_tools=False).content
+
+
+PLAN_TIMEOUT_S = 15
+
+
+@lru_cache(maxsize=1)
+def _ollama_planner() -> ChatOllama:
+    # format = the Plan's JSON schema: Ollama constrains decoding to it, so the output always parses.
+    # num_ctx must equal _ollama()'s: Ollama reloads the model (~7 s on a T4) whenever the context size changes.
+    return ChatOllama(model=settings.OLLAMA_MODEL, base_url=settings.OLLAMA_BASE_URL, temperature=0,
+                      num_ctx=OLLAMA_NUM_CTX, num_predict=200, keep_alive="30m", format=understand.schema(),
+                      client_kwargs={**_ollama_client_kwargs(), "timeout": PLAN_TIMEOUT_S})
+
+
+def _plan_message(prompt: str) -> Optional[understand.Plan]:
+    """L2: one short call, no tools, no history. None when it fails: the word-list path takes over."""
+    try:
+        if settings.LLM_PROVIDER == "ollama":
+            text = _ollama_planner().invoke([HumanMessage(prompt)]).content
+        else:
+            text = _llm(settings.GROQ_MODEL).bind(response_format={"type": "json_object"}).invoke(
+                [HumanMessage(prompt)]).content
+    except Exception:  # noqa: BLE001 - planner down / slow: the word-list path still answers
+        return None
+    return understand.parse(text)
+
+
+def _last_reply(state: State) -> str:
+    past = next((state["messages"][:i] for i, m in enumerate(state["messages"]) if m.id == state["turn_id"]), [])
+    return next((m.content for m in reversed(past) if isinstance(m, AIMessage) and isinstance(m.content, str)), "")
+
+
+def understand_node(state: State) -> dict:
+    """L2: what does the customer want? Off-topic gets its fixed reply here; everything else goes to prefetch,
+    which picks the workflow from the plan. Routing fails open: a message with a business cue is never refused."""
+    said = _turn_messages(state)[0].content
+    _status("Thinking…")
+    plan = _plan_message(understand.prompt(said, _last_reply(state), tuple(state.get("offered") or ())))
+    # The detected language stands: the model labels plain English ("how much is chicken tiqqa") as Roman Urdu.
+    language = state["language"]
+    step = {"plan": plan.model_dump(exclude_none=True) if plan else None}
+    if plan is None:  # the old path: word lists, then the FOOD / OTHER call for messages with no business cue
+        kind = behaviour.kind(said, in_conversation=len(state["messages"]) > 1, ask_model=_ask_router)
+        off_topic = kind == behaviour.OFF_TOPIC
+    else:
+        off_topic = plan.intent == "off_topic" and not behaviour.business(said)
+    if off_topic:
+        return {"language": language, "answer": behaviour.reply(behaviour.OFF_TOPIC, language, said),
+                "steps": state["steps"] + [step, {"behaviour": behaviour.OFF_TOPIC}]}
+    return {"language": language, "plan": plan.model_dump() if plan else None, "steps": state["steps"] + [step]}
+
+
 def agent(state: State, config: RunnableConfig) -> dict:
-    ctx = _ctx(config)
-    if not state["tools_called"] and not state["retried"]:
-        _status("Thinking…")
+    ctx = _ctx(config)  # "Thinking…" was already shown by understand_node, which runs before every agent turn
     topic_list = state.get("topics") or list(ALL_TOPICS)
     try:
         system = build_system_prompt(ctx, topic_list, state["language"], state.get("offered") or [])
@@ -350,6 +451,12 @@ def prefetch(state: State, config: RunnableConfig) -> dict:
     model writes, as if it had called them: small models otherwise skip them and answer from memory."""
     said = _turn_messages(state)[0].content
     offered = tuple(state.get("offered") or ())
+    plan = understand.Plan.model_validate(state["plan"]) if state.get("plan") else None
+    if plan:
+        calls, topic_list = understand.route(plan, said, offered)
+        if not calls:
+            return {"topics": topic_list}
+        return _run_prefetch(state, config, calls, topic_list, plan)
     calls = prefetch_tools(said)
     if not calls and offered:
         pointed = pointed_item(said, offered)
@@ -360,13 +467,81 @@ def prefetch(state: State, config: RunnableConfig) -> dict:
     topic_list = topics(said, calls, bool(offered))
     if not calls:
         return {"topics": topic_list}
+    return _run_prefetch(state, config, calls, topic_list, None)
+
+
+NOTHING_FITS = ("Nothing on our menu matches \"{wish}\"; the reply already starts by saying so. Just present a few "
+                "of these best sellers as other options (name, type and price exactly as given).")
+# Said by code, not left to the model (it skipped the sentence and offered Alfredo pasta as "something sweet").
+NOTHING_FITS_SAY = {
+    "latin": "We don't have anything {wish} on the menu right now, but these are our best sellers:",
+    "roman_urdu": "Abhi menu mein \"{wish}\" jaisa kuch nahi hai, lekin yeh hamare best sellers hain:",
+    "urdu_script": "ابھی مینو میں \"{wish}\" جیسا کچھ نہیں ہے، لیکن یہ ہمارے بیسٹ سیلرز ہیں:",
+}
+NOT_ON_MENU_NOTE = ("We don't have \"{item}\": the reply already starts by saying so. These are only the closest "
+                    "items: offer them as alternatives, never as {item}.")
+NOT_ON_MENU_SAY = {
+    "latin": "Sorry, we don't have {item} on the menu. You might like:",
+    "roman_urdu": "Maaf kijiye, menu mein {item} nahi hai. Yeh try kar sakte hain:",
+    "urdu_script": "معذرت، مینو میں {item} نہیں ہے۔ یہ آزما سکتے ہیں:",
+}
+
+
+def _run_prefetch(state: State, config: RunnableConfig, calls, topic_list: List[str],
+                  plan: Optional[understand.Plan]) -> dict:
+    """Run the calls as if the model had made them; the model then only words the reply."""
     call = AIMessage(content="", tool_calls=[{"name": n, "args": a, "id": f"prefetch_{i}", "type": "tool_call"}
                                              for i, (n, a) in enumerate(calls)])
     out = tools({**state, "messages": state["messages"] + [call]}, config)
     out["messages"] = [call] + out.get("messages", [])
+    if plan and plan.intent == "recommend" and plan.wish and not out.get("db_error") \
+            and not any(r.get("items") or r.get("deals") for r in out.get("tool_results") or []):
+        # A craving the menu has nothing for ("kuch khatta"): best sellers, so the reply has real items to offer
+        # instead of an empty search the model fills with invented dishes.
+        more = AIMessage(content="", tool_calls=[{"name": "get_best_sellers", "args": {}, "id": "prefetch_alt",
+                                                  "type": "tool_call"}])
+        extra = tools({**state, **out, "messages": state["messages"] + out["messages"] + [more]}, config)
+        if extra.get("db_error"):
+            return {**out, **extra, "messages": out["messages"]}
+        msgs = extra.get("messages") or []
+        if msgs:
+            result = json.loads(msgs[-1].content)
+            msgs[-1] = ToolMessage(content=_for_llm({**result, "note": NOTHING_FITS.format(wish=plan.wish)}),
+                                   tool_call_id="prefetch_alt", name="get_best_sellers")
+        out = {**out, **{k: v for k, v in extra.items() if k != "messages"},
+               "messages": out["messages"] + [more] + msgs, "nothing_fits": {"say": "wish", "what": plan.wish}}
+    if plan and plan.intent == "item_info" and not out.get("db_error"):
+        out = _mark_missing_items(out)
     out["prefetched"] = True
     out["topics"] = topic_list
     return out
+
+
+MISSING_WORDS = re.compile(r"don['’]?t have|do not have|not on (our|the) menu|nahi hai|nahin hai|نہیں ہے", re.I)
+
+
+def _says_missing(answer: str, what: str) -> bool:
+    """The model already said we don't have it: code doesn't say it a second time."""
+    first = re.split(r"(?<=[.!?\n])\s", answer.strip(), maxsplit=1)[0]
+    return bool(MISSING_WORDS.search(first)) and any(w in first.lower() for w in what.lower().split())
+
+
+def _mark_missing_items(out: dict) -> dict:
+    """A named item we don't have ("sushi"): the search still returns its nearest neighbours (burgers). Say it's
+    not on the menu from code, and tell the model the items are alternatives."""
+    msgs = list(out["messages"])
+    for n, m in enumerate(msgs):
+        if not (isinstance(m, ToolMessage) and m.name == "search_menu"):
+            continue
+        asked = next((c["args"].get("query", "") for c in msgs[0].tool_calls if c["id"] == m.tool_call_id), "")
+        result = json.loads(m.content)
+        if result.get("exact") is False or not understand.missing_item(asked, result.get("items") or [],
+                                                                       index().corrections(asked)):
+            continue
+        msgs[n] = ToolMessage(content=_for_llm({**result, "note": NOT_ON_MENU_NOTE.format(item=asked)}),
+                              tool_call_id=m.tool_call_id, name=m.name)
+        out = {**out, "nothing_fits": {"say": "item", "what": asked}}
+    return {**out, "messages": msgs}
 
 
 def post_checks(state: State, config: RunnableConfig) -> dict:
@@ -384,15 +559,21 @@ def post_checks(state: State, config: RunnableConfig) -> dict:
     steps = state["steps"] + [{"draft": draft, "guard_problems": problems}]
     if not problems:
         return {"answer": draft, "steps": steps}
+    if _nothing_on_menu(steps):
+        # The menu has none: say so plainly instead of letting the model try (and invent items) again.
+        return {"answer": NOT_ON_MENU[_reply_lang(state)], "steps": steps}
     if state["retried"] or time.time() - state["started_at"] > TIME_BUDGET_S:
         # A draft whose facts passed and whose only fault was English instead of Roman Urdu beats the
         # fallback. Not an Urdu-script slip: small models garble it ("yہ رہی آپکی کارت").
-        usable = [s["draft"] for s in steps if s.get("draft") and s.get("guard_problems") == [NOT_ROMAN_URDU]]
+        usable = [s["draft"] for s in steps if s.get("draft") and s.get("guard_problems") == [NOT_ROMAN_URDU]
+                  and not s["draft"].lstrip().startswith("{")]  # never a raw tool call the model wrote as text
         return {"answer": usable[-1], "steps": steps} if usable else {**_fallback(state), "steps": steps}
     _status("Double-checking the answer…")
-    feedback = HumanMessage("[system check] Your reply failed verification: " + "; ".join(problems)
-                            + ". Call the right tool if needed and answer again using only facts from "
-                              "tool results.")
+    # After prefetch the model has no tools: asking it to "call the right tool" made it write a tool call as text.
+    fix = ("Write the answer again using only facts from the tool results above; don't call tools."
+           if state.get("prefetched") else "Call the right tool if needed and answer again using only facts from "
+                                           "tool results.")
+    feedback = HumanMessage("[system check] Your reply failed verification: " + "; ".join(problems) + ". " + fix)
     return {"retried": True, "steps": steps, "messages": [feedback]}
 
 
@@ -407,6 +588,10 @@ def format_response(state: State, config: RunnableConfig) -> dict:
                 response = _offline_response(ctx, question, state)
             else:
                 answer = state["answer"]
+                fits = state.get("nothing_fits")
+                if fits and not state.get("fallback") and not _says_missing(answer, fits["what"]):
+                    say = NOTHING_FITS_SAY if fits["say"] == "wish" else NOT_ON_MENU_SAY
+                    answer = say[_reply_lang(state)].format(wish=fits["what"], item=fits["what"]) + "\n\n" + answer
                 cards = (_found_cards(state["tool_results"]) if state.get("fallback")
                          else _which_one_cards(state["tool_results"]) or _cards(answer, state["tool_results"]))
                 response = {"answer": answer, "items": cards,
@@ -422,7 +607,8 @@ def format_response(state: State, config: RunnableConfig) -> dict:
     latency = round(time.time() - state["started_at"], 2)
     response["debug"] = {"tools": state["tools_called"], "latency_s": latency, "guard_retry": state["retried"],
                          "offline": bool(state.get("offline"))}
-    _trace({"at": response["as_of"], "user_id": ctx.user_id, "branch_id": ctx.branch_id, "message": question,
+    _trace({"at": response["as_of"], "model": _model_name(), "user_id": ctx.user_id, "branch_id": ctx.branch_id,
+            "message": question,
             "steps": state["steps"], "answer": response["answer"], "latency_s": latency})
     if failed:
         # Forget the whole turn and undo its cart changes, so "Try again" starts clean.
@@ -438,14 +624,23 @@ def format_response(state: State, config: RunnableConfig) -> dict:
     # What "the first one" / "large" / "Crown Crust" refers to next: this answer's cards; with no new cards the
     # last list stays, until the cart changes (then an old list would point at the wrong thing).
     offered = [{"item_id": i["item_id"], "name": i["name"], "type": i.get("type")} for i in response["items"]]
-    if not offered and (state.get("cart") or []) == (state.get("cart_before") or []):
-        offered = state.get("offered") or []
+    before = state.get("offered") or []
+    unchanged_cart = (state.get("cart") or []) == (state.get("cart_before") or [])
+    names = lambda items: {i["name"].strip().lower() for i in items}  # by name: the menu repeats items under new ids
+    if unchanged_cart and (not offered or names(offered) <= names(before)):
+        # Nothing new shown, or only a look at one of the listed items ("pehli wali kitne ki hai?"): the list
+        # stays, so "dusri wali" next still means the second item of that list.
+        offered = before
     return {"response": response, "messages": removals + [AIMessage(content=response["answer"])], "offered": offered}
 
 
 # ---------- routing ----------
 
 def route_after_pre_checks(state: State) -> str:
+    return "format_response" if state.get("answer") else "understand"
+
+
+def route_after_understand(state: State) -> str:
     return "format_response" if state.get("answer") else "prefetch"
 
 
@@ -468,12 +663,33 @@ def route_after_post_checks(state: State) -> str:
 
 # ---------- helpers ----------
 
+def _reply_lang(state: State) -> str:
+    return state.get("language") if state.get("language") in FALLBACKS else "roman_urdu" \
+        if state.get("language") == "mixed" else "latin"
+
+
 def _fallback(state: State) -> dict:
     """Never a dead end: in the customer's language, with whatever the tools really found as cards."""
-    lang = state.get("language") if state.get("language") in FALLBACKS else "roman_urdu" \
-        if state.get("language") == "mixed" else "latin"
     found = _found_cards(state.get("tool_results") or [])
-    return {"answer": (FOUND_FALLBACKS if found else FALLBACKS)[lang], "fallback": True}
+    return {"answer": (FOUND_FALLBACKS if found else FALLBACKS)[_reply_lang(state)], "fallback": True}
+
+
+def _nothing_on_menu(steps: List[dict]) -> bool:
+    """Every tool call this turn was a plain menu search (no budget, not deals-only) that matched nothing.
+    A filtered search finding nothing means "nothing under that budget", not "we don't have it"."""
+    calls = [s for s in steps if "tool" in s]
+    if not calls:
+        return False
+    for s in calls:
+        if s["tool"] != "search_menu" or (s.get("result") or {}).get("note") != "no_match":
+            return False
+        try:
+            args = SearchMenuArgs.model_validate(_lenient(SearchMenuArgs, s.get("args") or {}))
+        except ValidationError:
+            return False
+        if args.max_price is not None or args.deals_only:
+            return False
+    return True
 
 
 def _which_one_cards(results: List[dict]) -> List[dict]:
@@ -572,6 +788,10 @@ def _offline_response(ctx: RequestContext, message: str, state: State) -> dict:
             "as_of": utc_now_iso()}
 
 
+def _model_name() -> str:
+    return f"ollama:{settings.OLLAMA_MODEL}" if settings.LLM_PROVIDER == "ollama" else f"groq:{settings.GROQ_MODEL}"
+
+
 def _trace(record: dict) -> None:
     TRACE_FILE.parent.mkdir(exist_ok=True)
     with TRACE_FILE.open("a") as f:
@@ -583,13 +803,15 @@ def _trace(record: dict) -> None:
 def build_graph(checkpointer=None):
     g = StateGraph(State)
     g.add_node("pre_checks", pre_checks)
+    g.add_node("understand", understand_node)
     g.add_node("prefetch", prefetch)
     g.add_node("agent", agent)
     g.add_node("tools", tools)
     g.add_node("post_checks", post_checks)
     g.add_node("format_response", format_response)
     g.add_edge(START, "pre_checks")
-    g.add_conditional_edges("pre_checks", route_after_pre_checks, ["prefetch", "format_response"])
+    g.add_conditional_edges("pre_checks", route_after_pre_checks, ["understand", "format_response"])
+    g.add_conditional_edges("understand", route_after_understand, ["prefetch", "format_response"])
     g.add_conditional_edges("prefetch", route_after_tools, ["agent", "format_response"])
     g.add_conditional_edges("agent", route_after_agent, ["tools", "post_checks", "format_response"])
     g.add_conditional_edges("tools", route_after_tools, ["agent", "format_response"])

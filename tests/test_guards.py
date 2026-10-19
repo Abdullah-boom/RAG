@@ -126,3 +126,36 @@ def test_made_up_items_are_caught_real_ones_pass():
     assert check_answer(real, results, ["search_menu"], "burgers?", menu) == []
     assert check_answer("Our **I-8 Islamabad** branch is open.", [{"open_now": True}], ["check_branch_status"],
                         "open?", menu, ["I-8 Islamabad"]) == []
+
+
+def test_text_tool_call_is_read_as_a_call():
+    from app.agent.graph import _text_tool_call
+    names = {"search_menu"}
+    text = '{"name": "search_menu", "parameters": {"query": "sweet", "deals_only": False, "max_price": null}}'
+    assert _text_tool_call(text, names) == {"name": "search_menu",
+                                            "args": {"query": "sweet", "deals_only": False, "max_price": None}}
+    assert _text_tool_call('```json\n{"name": "search_menu", "arguments": {"query": "x"}}\n```', names)["args"] == {"query": "x"}
+    assert _text_tool_call('{"name": "delete_everything", "parameters": {}}', names) is None
+    assert _text_tool_call("Aap ke liye yeh options hain", names) is None
+    assert _text_tool_call('[1, 2]', names) is None
+
+
+def test_nothing_on_menu_only_for_plain_searches():
+    from app.agent.graph import _nothing_on_menu
+    empty = {"items": [], "note": "no_match"}
+    plain = {"tool": "search_menu", "args": {"query": "sour", "max_price": "None", "deals_only": "False", "limit": "10"},
+             "result": empty}
+    assert _nothing_on_menu([plain, {"draft": "x", "guard_problems": ["y"]}])
+    assert not _nothing_on_menu([{**plain, "args": {"query": "sour", "max_price": "800"}}])  # nothing under a budget
+    assert not _nothing_on_menu([{**plain, "args": {"query": "sour", "deals_only": True}}])
+    assert not _nothing_on_menu([plain, {"tool": "search_menu", "args": {"query": "lemon"}, "result": {"items": [{}]}}])
+    assert not _nothing_on_menu([{"tool": "get_deals", "args": {}, "result": empty}])
+    assert not _nothing_on_menu([])
+
+
+def test_placeholder_instead_of_a_value_fails():
+    from app.agent.guards import check_answer
+    cart = [{"cart": {"subtotal": 2610}}]
+    problems = check_answer("Total: Rs 2610. With tax it comes to Rs [calculate_total].", cart, ["view_cart"], "cart")
+    assert any("placeholder" in p for p in problems)
+    assert not check_answer("Total: Rs 2610. Tax and delivery are added at checkout.", cart, ["view_cart"], "cart")

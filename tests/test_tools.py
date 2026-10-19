@@ -30,7 +30,7 @@ def test_calculator_uses_db_prices_and_requires_size():
 
 
 def test_invalid_args_return_structured_error():
-    assert run_tool(CTX, "search_menu", '{"query": "x", "limit": 99}')["error"] == "invalid_arguments"
+    assert run_tool(CTX, "search_menu", '{"limit": 3}')["error"] == "invalid_arguments"  # query is required
     assert run_tool(CTX, "nope", "{}")["error"] == "unknown_tool"
     assert run_tool(CTX, "get_item_details", '{"item_id": "not-an-id"}') == {"error": "not_found"}
 
@@ -183,3 +183,11 @@ def test_descriptions_are_wishes_not_names(said, is_wish):
     """'something cheesey' gets suggestions; only item names get "couldn't find exactly"."""
     import app.tools as t
     assert bool(t.DESCRIPTION.search(said)) is is_wish
+
+
+def test_small_model_filler_args_are_tolerated():
+    # Llama 3.1 8B sends every optional argument, as strings: "None" for not given, a limit above the cap.
+    r = run_tool(CTX, "search_menu",
+                 '{"query": "cheesy", "deals_only": "False", "limit": "10", "max_price": "None", "picked": "False"}')
+    assert "error" not in r and r["items"]
+    assert len(r["items"]) <= 6

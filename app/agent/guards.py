@@ -33,6 +33,8 @@ UNSURE = re.compile(r"did you mean|do you mean|couldn['’]?t find|could not fin
 LOOKUP_TOOLS = {"search_menu", "get_item_details", "get_deals", "get_best_sellers", "calculate_total",
                 "add_to_cart", "remove_from_cart", "view_cart", "clear_cart", "get_payment_methods",
                 "set_payment_method", "review_order"}
+# "Rs [calculate_total]", "{subtotal}": a value the model meant to fill in and didn't.
+PLACEHOLDER = re.compile(r"\[[a-z]+(?:_[a-z]+)+\]|\{[a-z]+(?:_[a-z]+)*\}|\[(?:total|price|subtotal|amount)\]", re.I)
 PHONE = re.compile(r"(?:\+92|0092|\b0)3\d{2}[\s-]?\d{7}\b")
 EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 
@@ -179,6 +181,9 @@ def check_answer(answer: str, tool_results: Iterable[dict], tools_called: Iterab
     if STATUS_WORDS.search(answer or "") and not (called & (ORDER_TOOLS | PAYMENT_TOOLS)) \
             and "order" in (answer or "").lower():
         problems.append("states an order status without calling an order tool")
+    if PLACEHOLDER.search(text):
+        problems.append("the reply has a placeholder like [calculate_total] instead of a value: write only values "
+                        "the tool results give, and leave out any you don't have")
     made_up = invented_items(text, results, menu_names, other_names)
     if made_up:
         problems.append(f"names item(s) that aren't on the menu or in this turn's tool results: {made_up[:3]}; "
